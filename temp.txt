@@ -1,1 +1,19 @@
-hi 
+There were not zero incidents, but whenever an issue came, I handled it quickly and made sure it was resolved properly.
+
+I worked on Sonar technical debt and reduced many code smells and vulnerabilities.
+
+I improved the unit tests and helped increase the code coverage.
+
+All tests (Jest + Cypress) were kept passing and stable.
+
+Code coverage was maintained above 80% throughout the year.
+
+There were no stakeholder or team escalations raised because of my work.
+
+Deployments from my side were stable with no rollbacks or urgent fix requirements.
+
+I supported faster release cycles by fixing issues on time and ensuring smooth deployments.
+
+Production issues assigned to me were handled properly, reducing repeated bugs.
+
+My work on testing contributed to better automation and regression stability.
