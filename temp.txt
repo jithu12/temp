@@ -1,3 +1,112 @@
-I completed all mandatory trainings assigned for my role and ensured continuous learning throughout the year. I submitted my TT (SOFI) on time by following the Scrum Master’s Excel schedule without any delays. I attended all team meetings regularly and stayed updated on all discussions and decisions. I improved my skills in ReactJS and NodeJS by working on real tasks, fixing issues, and implementing best practices in both frontend and backend development. I also actively participated in Full Stack League sessions, maintained good presence in all discussions, and collaborated with team members and tech leads during these instances.
+✅ 1. SonarQube Upgrade to 2025.1 LTA
+Parent Story: GTT-29465 — SonarQube Upgrade 2025.1 LTA
+Sub-Stories
+1.1 Validate Current Pipelines for Scanner Compatibility
 
-In addition, I proposed solutions to improve the application’s performance and shared ideas wherever possible. I also contributed to CSR activities and participated in hackathons, representing the team with a positive attitude and willingness to learn. Overall, I maintained consistency, followed processes, and supported the team in all activities throughout the year.
+Description: Identify all projects overriding scanner version and list impacted pipelines.
+Story Points: 3
+
+1.2 Update Scanner Versions to 7.2.0+5079
+
+Description: Apply scanner version updates in workflows (SystemTeam or custom CI/CD).
+Story Points: 3
+
+1.3 Double-Run Analysis Using UAT Sonar Instance
+
+Description: Perform baseline + new-version comparison and document rating changes.
+Story Points: 5
+
+1.4 Final Validation & Upgrade Execution
+
+Description: Upgrade SonarQube in production and validate all project statuses.
+Story Points: 3
+
+Total Estimate: 14 points
+✅ 2. PlatformAPI 4.5 Observability Update
+Parent Story: GTT-29355 — Update to PlatformAPI 4.5
+Sub-Stories
+2.1 Upgrade PlatformAPI Dependency to 4.5
+
+Story Points: 3
+
+2.2 Update Asynchronous Instrumentation (sg_metrics)
+
+Story Points: 5
+
+2.3 Validate CorrelationID & Jaeger Traces
+
+Story Points: 3
+
+2.4 Regression Testing Across Services
+
+Story Points: 3
+
+Total Estimate: 14 points
+✅ 3. SGConnect Authentication for Grafana
+Parent Story: GTT-20042 — SGConnect for Grafana
+Sub-Stories
+3.1 Configure SGConnect OAuth/OIDC Client for Grafana
+
+Story Points: 5
+
+3.2 Implement Scope-to-Role Mapping for Read/Write/Admin
+
+Story Points: 3
+
+3.3 End-to-End Authentication & Access Testing
+
+Story Points: 5
+
+Total Estimate: 13 points
+✅ 4. New /health Standard Migration
+Parent Story: GTT-25175 — Move to New /health
+Sub-Stories
+4.1 Study New /health Requirements & Review Documentation
+
+Story Points: 2
+
+4.2 Implement New /health Endpoint Structure
+
+Story Points: 5
+
+4.3 Validate Integration With Day-Level Reliability Framework
+
+Story Points: 3
+
+Total Estimate: 10 points
+✅ 5. Fixed IP Feasibility Study
+Parent Story: GTT-23497 — Fixed IP for Workspace
+Sub-Stories
+5.1 Technical Feasibility Study (Network, NAT, Platform)
+
+Story Points: 3
+
+5.2 Security & CoE Assessment
+
+Story Points: 2
+
+5.3 Build Fixed-IP POC Workspace (only if feasible)
+
+Story Points: 5
+
+Total Estimate: 10 points
+✅ 6. Resource Stop & Deletion Strategy (Event Bus)
+Parent Story: GTT-29059 — Resource Stop & Deletion Strategy
+Sub-Stories
+6.1 Define Resource Stop/Deletion Architecture
+
+Story Points: 5
+
+6.2 Implement Event Bus Handlers for Deactivate/Delete Events
+
+Story Points: 5
+
+6.3 Build Garbage Collector for Orphan Resources
+
+Story Points: 3
+
+6.4 Presentation to SWAG & Architecture League
+
+Story Points: 2
+
+Total Estimate: 15 points
