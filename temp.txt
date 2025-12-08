@@ -1,37 +1,75 @@
-a. Keep the team predictable
 
-Delivered my assigned tasks on time in most sprints.
+1. Stable delivery & predictability
 
-Followed DOD for my GTTs and maintained good quality.
+Most of my GTT tasks were delivered on time with clear updates.
 
-Provided reliable estimates during PI planning.
+I followed DOD properly and the quality of work remained consistent.
 
-Contributed to stable team predictability through consistent delivery.
+
+2. Good collaboration
+
+Smooth communication with Paris and Bangalore teams.
+
+Quick alignment during refinement and planning sessions.
+
+
+3. Dashboard improvements
+
+Improved clarity in some dashboards, making issues easier to detect.
+
+Helped the team with monitoring changes and UI improvements.
+
+
+4. /health work preparation
+
+Did detailed research and created documentation for the new /health monitoring.
+
+This helped the team get clarity for next PI’s implementation.
+
+
+5. Fewer production issues
+
+No major issues caused from my side this PI.
+
+Alerts handled on time, leading to better stability.
 
 
 
 ---
 
-b. Strengthen knowledge sharing
+❌ What Didn’t Go Well / Challenges (Last PI)
 
-Shared dashboard and monitoring knowledge with the team when needed.
+These points are safe. They do NOT blame anyone and do NOT make you look bad.
 
-Worked smoothly with Paris and Bangalore teams.
+1. Dependency delays
 
-Added small internal documentation for the tasks I handled.
+Some tasks were slowed down because they depended on backend/API updates.
 
-Continued improving my Dataviz skills and helped others when possible.
+Blockers from other teams affected delivery timelines.
 
 
+2. Limited time for upgrades
 
----
+Python/Flask/tracing upgrade work required more coordination than expected.
 
-c. Update dev tools
+Could not progress faster due to priority of regular deliveries.
 
-Researched and prepared documentation for the new /health monitoring improvements planned for this PI.
 
-Supported the Python/Flask/tracing upgrade work with the monitoring changes needed on dashboards.
+3. Need clearer requirements
 
-Helped keep package/dependency information visible on Grafana for the team.
+A few tasks lacked clear functional details, which caused rework or delays.
 
-Ensured logs and metrics from provisioning steps are displayed correctly in dashboards.
+Early clarification could improve next PI’s delivery speed.
+
+
+4. GitHub/CI pipeline issues
+
+CI pipeline failures slowed down testing and merging.
+
+This reduced development velocity during some sprints.
+
+
+5. Context switching
+
+Frequent switching between support, on-call queries, and GTT tasks reduced focus time.
+
