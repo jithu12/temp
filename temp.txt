@@ -1,23 +1,37 @@
-a. Maintain high product quality
+a. Keep the team predictable
 
-Kept Dataviz dashboards stable, accurate, and up to date.
+Delivered my assigned tasks on time in most sprints.
 
-Supported integration checks by monitoring API routes through Grafana.
+Followed DOD for my GTTs and maintained good quality.
 
-Followed branch protection rules and kept repositories clean.
+Provided reliable estimates during PI planning.
 
-Ensured no unplanned or incorrect data reached production dashboards.
+Contributed to stable team predictability through consistent delivery.
 
 
 
 ---
 
-b. 0 bugs & customer support
+b. Strengthen knowledge sharing
 
-No major bugs from my side during the year.
+Shared dashboard and monitoring knowledge with the team when needed.
 
-Responded to Unity tickets on time and supported users clearly.
+Worked smoothly with Paris and Bangalore teams.
 
-Checked dashboards after every release to avoid regressions.
+Added small internal documentation for the tasks I handled.
 
-Maintained small documentation updates for the dashboards I worked on.
+Continued improving my Dataviz skills and helped others when possible.
+
+
+
+---
+
+c. Update dev tools
+
+Researched and prepared documentation for the new /health monitoring improvements planned for this PI.
+
+Supported the Python/Flask/tracing upgrade work with the monitoring changes needed on dashboards.
+
+Helped keep package/dependency information visible on Grafana for the team.
+
+Ensured logs and metrics from provisioning steps are displayed correctly in dashboards.
