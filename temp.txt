@@ -1,24 +1,43 @@
-1. Better accountability
+a. Maintain high production quality
 
-Kept tasks updated and shared progress clearly.
+Kept Dataviz dashboards stable with no issues from my side except one escalation last month, which I handled quickly.
 
-Reported blockers early and supported timely delivery.
+Monitored API health and reduced errors using Grafana alerts.
 
-
-2. Unified JIRA process
-
-Followed one common JIRA workflow across teams.
-
-Helped maintain simple and consistent sprint reporting.
+Helped maintain good KCI performance by reacting fast to incidents.
 
 
-3. Work efficiently
 
-Identified manual tasks and started building automations.
+---
 
-Could not fully finish automation due to GitHub pipeline blockers, but main design and approach are ready.
+b. Control operational risks
 
-Completed regular tasks on time and supported the team.
+Supported AZ Down test preparations with the required dashboards.
 
+Updated dashboards to help track system obsolescence (OS, VM, API versions).
+
+Assisted the team with observability improvements when needed.
+
+
+
+---
+
+c. Strengthen security
+
+Ensured no secrets were present in dashboards or Git repositories.
+
+Helped track vulnerability and patching status through dashboards.
+
+Followed security practices for production access and monitoring.
+
+
+
+---
+
+d. Label and data quality
+
+Kept dashboard labels, metadata, and panels updated.
+
+Removed outdated labels and improved data accuracy.
 
 
