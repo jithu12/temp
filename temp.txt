@@ -1,43 +1,23 @@
-a. Maintain high production quality
+a. Maintain high product quality
 
-Kept Dataviz dashboards stable with no issues from my side except one escalation last month, which I handled quickly.
+Kept Dataviz dashboards stable, accurate, and up to date.
 
-Monitored API health and reduced errors using Grafana alerts.
+Supported integration checks by monitoring API routes through Grafana.
 
-Helped maintain good KCI performance by reacting fast to incidents.
+Followed branch protection rules and kept repositories clean.
 
-
-
----
-
-b. Control operational risks
-
-Supported AZ Down test preparations with the required dashboards.
-
-Updated dashboards to help track system obsolescence (OS, VM, API versions).
-
-Assisted the team with observability improvements when needed.
+Ensured no unplanned or incorrect data reached production dashboards.
 
 
 
 ---
 
-c. Strengthen security
+b. 0 bugs & customer support
 
-Ensured no secrets were present in dashboards or Git repositories.
+No major bugs from my side during the year.
 
-Helped track vulnerability and patching status through dashboards.
+Responded to Unity tickets on time and supported users clearly.
 
-Followed security practices for production access and monitoring.
+Checked dashboards after every release to avoid regressions.
 
-
-
----
-
-d. Label and data quality
-
-Kept dashboard labels, metadata, and panels updated.
-
-Removed outdated labels and improved data accuracy.
-
-
+Maintained small documentation updates for the dashboards I worked on.
