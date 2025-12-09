@@ -1,75 +1,147 @@
-
-1. Stable delivery & predictability
-
-Most of my GTT tasks were delivered on time with clear updates.
-
-I followed DOD properly and the quality of work remained consistent.
+Perfect bro. I’ve gone through all screenshots.
+Below is a clean, professional, fully corrected version of everything he was trying to say — written exactly as he would say it in proper English.
 
 
-2. Good collaboration
+---
 
-Smooth communication with Paris and Bangalore teams.
+✅ Clean & Professional Version of the Conversation
 
-Quick alignment during refinement and planning sessions.
+1. About the Behavioral Events
 
+These events are available only in Paris, North, and New York.
 
-3. Dashboard improvements
-
-Improved clarity in some dashboards, making issues easier to detect.
-
-Helped the team with monitoring changes and UI improvements.
-
-
-4. /health work preparation
-
-Did detailed research and created documentation for the new /health monitoring.
-
-This helped the team get clarity for next PI’s implementation.
-
-
-5. Fewer production issues
-
-No major issues caused from my side this PI.
-
-Alerts handled on time, leading to better stability.
+This is a behavioral feature, not an issue. Only these three regions support it.
 
 
 
 ---
 
-❌ What Didn’t Go Well / Challenges (Last PI)
+2. About communicating the details
 
-These points are safe. They do NOT blame anyone and do NOT make you look bad.
-
-1. Dependency delays
-
-Some tasks were slowed down because they depended on backend/API updates.
-
-Blockers from other teams affected delivery timelines.
+“How should we communicate this?”
+→ Meaning: you need to align on how to explain this to stakeholders.
 
 
-2. Limited time for upgrades
 
-Python/Flask/tracing upgrade work required more coordination than expected.
+---
 
-Could not progress faster due to priority of regular deliveries.
+3. About File Transfer Monitoring
 
+“By default, we do not provide monitoring for file transfers.”
 
-3. Need clearer requirements
+“At the moment, we do not offer any default dashboard for it.”
 
-A few tasks lacked clear functional details, which caused rework or delays.
-
-Early clarification could improve next PI’s delivery speed.
+“If you need a dashboard, it has to be created manually.”
 
 
-4. GitHub/CI pipeline issues
 
-CI pipeline failures slowed down testing and merging.
+---
 
-This reduced development velocity during some sprints.
+4. About the dashboard
+
+“We will take your request and work on building a dashboard for file transfers.”
+
+“We are working on it and will update you.”
 
 
-5. Context switching
 
-Frequent switching between support, on-call queries, and GTT tasks reduced focus time.
+---
 
+5. About what you should tell the other person
+
+“You can mention that there is no default monitoring or dashboard for file transfers.”
+
+“If he wants a dashboard, you can create it on your side.”
+
+“You can share the link I provided and mention that these are the available metric families and metric names.”
+
+
+
+---
+
+6. About raising the requirement
+
+“This is a new requirement. We have taken it from the team, and I will raise it with them so we can build it.”
+
+“For this dashboard, we need some time. If he asks how long it will take, you can mention that it's being worked on.”
+
+
+
+---
+
+7. About expectations
+
+“Don’t give any false commitments.”
+
+“Just mention the actual status.”
+
+
+
+---
+
+8. About global handling
+
+“We are taking this as a global request and will build it accordingly.”
+
+
+
+---
+
+9. About answering the question
+
+“If the question is related to file transfer, the answer is simply that monitoring is not available by default.”
+
+
+
+---
+
+10. About what you will handle
+
+“You will be able to handle this point, right?”
+
+
+
+---
+
+11. About next steps
+
+“We will check with the team and update you.”
+
+“Don’t commit anything tomorrow; just share the current status.”
+
+
+
+---
+
+✅ Ready-to-copy Professional Summary (if you need to send to manager/client)
+
+Here is a polished summary you can use:
+
+
+---
+
+Summary of Discussion
+
+Behavioral events are available only in Paris, North, and New York regions.
+
+File transfer monitoring is not provided by default, and no default dashboard exists.
+
+A new requirement has been raised to create a dashboard for file transfers. The team needs some time to work on this.
+
+Until the dashboard is built, you can share the documentation link and mention the available metric families and metric names.
+
+You should avoid giving any false commitments and communicate the exact status.
+
+The request is being taken globally, and updates will be provided after checking with the team.
+
+
+
+---
+
+Bro, if you want, I can also format this as:
+✔️ A ticket update
+✔️ Meeting minutes
+✔️ WhatsApp message
+✔️ Email to your manager
+
+Just tell me which format you want.
