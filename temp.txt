@@ -1,3 +1,52 @@
-By default, monitoring for file transfers is not provided, and there is no default dashboard available for this. If a dashboard is required, it must be created manually from the user side.
+# tests/test_construct_links.py
+import pytest
 
-We have taken your request into consideration and will work on building a dedicated dashboard for file transfers. This is a new requirement, and I will raise it with our team so we can develop it accordingly. As this is being handled as a global request, we will update you once we have more information on the timeline and progress.
+# adjust the import below to match where your function actually lives
+# example: from my_package.utils import construct_links
+from utils import construct_links
+
+
+def test_no_limit_but_offset():
+    """
+    Covers: if not limit and offset is not None -> query = f"offset={offset}"
+    """
+    res = construct_links(base_url="/v1/workspaces", limit=None, offset=5, has_next=False)
+    assert isinstance(res, dict)
+    assert "links" in res
+    # self should include only offset
+    assert res["links"]["self"] == "/v1/workspaces?offset=5"
+    # no next link because has_next is False
+    assert "next" not in res["links"]
+
+
+def test_limit_present_offset_none_has_next_true():
+    """
+    Covers: limit is not None branch where offset is None (self -> limit only)
+    Also covers next_offset = limit when offset is None
+    """
+    res = construct_links(base_url="/v1/workspaces", limit=10, offset=None, has_next=True)
+    assert "links" in res
+    # self should include only limit
+    assert res["links"]["self"] == "/v1/workspaces?limit=10"
+    # next should be created with offset == limit (10)
+    assert "next" in res["links"]
+    assert res["links"]["next"] == "/v1/workspaces?limit=10&offset=10"
+
+
+def test_limit_and_offset_present_has_next_true():
+    """
+    Covers: limit is not None and offset is not None,
+    next_offset = offset + limit path
+    """
+    res = construct_links(base_url="/v1/workspaces", limit=10, offset=20, has_next=True)
+    assert res["links"]["self"] == "/v1/workspaces?limit=10&offset=20"
+    # next should be offset + limit => 30
+    assert res["links"]["next"] == "/v1/workspaces?limit=10&offset=30"
+
+
+def test_no_limit_no_offset():
+    """
+    Covers: neither limit nor offset -> no query part at all
+    """
+    res = construct_links(base_url="/v1/workspaces", limit=None, offset=None, has_next=False)
+    assert res == {"links": {"self": "/v1/workspaces"}}
