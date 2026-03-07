@@ -1,168 +1,92 @@
-Got it bro 👍 — this is actually **very important**.
-If your **lead specifically said to create `accounts_controller.py`**, then the previous approach using `workspace_controller.py` is **not what they expect**.
+You’re absolutely right to call that out 👍
+If the requirement is **“delete everything related to a specific workspace”**, then the API **must accept only `workspace_id`**, not `account_id`. Your existing delete controller already follows that pattern, and we should keep the same style for activate/deactivate.
 
-Your lead likely wants **account lifecycle endpoints** that will **trigger workspace lifecycle internally**.
+So **do NOT use `accounts_controller.py` for this feature**.
+Everything should stay in **`workspace_controller.py`**, because the resource is **workspace**.
 
-Meaning the flow becomes:
-
-```
-API (accounts_controller)
-        ↓
-core.accounts.request_account_deactivation()
-        ↓
-core.workspace.deactivate_workspaces_by_owner_account_id()
-```
-
-So **account → workspace cascade**.
+Below is the **final code consistent with your existing delete implementation**.
 
 ---
 
-# Correct Architecture Your Lead Wants
+# 1️⃣ Keep Your Existing Delete (DO NOT CHANGE)
 
-```
-accounts_controller.py
-        ↓
-core.accounts
-        ↓
-workspace service
-        ↓
-activate / deactivate / delete workspaces
-```
-
-Your core PR already contains this logic.
-
----
-
-# 1️⃣ Create This File
-
-Create:
-
-```
-dataviz_api/apis/v1/accounts_controller.py
-```
-
----
-
-# 2️⃣ FINAL `accounts_controller.py`
-
-You can **copy paste this completely**.
+From your screenshot, this is correct:
 
 ```python
-from uuid import UUID
-from typing import Any, Dict, Tuple
-import logging
+def workspace_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
+    """Delete a workspace given its identifier"""
 
-from flask import current_app
-
-from dataviz_api.core import get_core
-from dataviz_api.errors import IncorrectQueryError
-from platform_api.permissions import get_current_account_id
-
-logger = logging.getLogger(__name__)
-
-
-def accounts_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """Deactivate an account and all its workspaces"""
+    try:
+        workspace_id = UUID(kwargs.get("workspace_id"))
+    except Exception as e:
+        raise IncorrectQueryError() from e
 
     core = get_core(current_app)
 
     try:
-        account_id = UUID(kwargs.get("account_id"))
-        owner_account_id = UUID(str(get_current_account_id()))
-
-        logger.info(
-            f"Requesting deactivation for account_id={account_id} "
-            f"by owner_account_id={owner_account_id}"
+        workspace = core.workspace.request_workspace_deletion(
+            account_id=get_current_account_id(),
+            workspace_id=workspace_id
         )
 
-        core.accounts.request_account_deactivation(
-            owner_account_id=owner_account_id,
-            account_id=account_id
-        )
+        return core.workspace.to_dict(workspace), 204
 
-        return {
-            "status": "deactivation_requested",
-            "account_id": str(account_id)
-        }, 202
+    except ValueError:
+        return WORKSPACE_NOT_FOUND_ERROR_DATA, 404
+
+    except WorkspaceNotFoundError:
+        return WORKSPACE_NOT_FOUND_ERROR_DATA, 404
 
     except Exception as e:
-        logger.exception("Account deactivation failed")
+        return {"error": str(e)}, 500
+```
 
-        return {
-            "error": {
-                "code": "DVZ-ACCOUNT-DEACTIVATE-FAILED",
-                "message": str(e),
-                "statusCode": "500"
-            }
-        }, 500
+This correctly:
 
+```
+DELETE /workspaces/{workspace_id}
+        ↓
+workspace_controller
+        ↓
+core.workspace.request_workspace_deletion()
+        ↓
+delete_workspace()  (your core logic)
+```
 
-def accounts_reactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """Reactivate an account and all its workspaces"""
+---
+
+# 2️⃣ Add Activate Workspace
+
+Add this **below your delete function**.
+
+```python
+def workspace_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
+    """Activate a workspace given its identifier"""
+
+    try:
+        workspace_id = UUID(kwargs.get("workspace_id"))
+    except Exception as e:
+        raise IncorrectQueryError() from e
 
     core = get_core(current_app)
 
     try:
-        account_id = UUID(kwargs.get("account_id"))
-        owner_account_id = UUID(str(get_current_account_id()))
+        workspace = core.workspace.reactivate_workspace(workspace_id)
 
-        logger.info(
-            f"Requesting reactivation for account_id={account_id} "
-            f"by owner_account_id={owner_account_id}"
-        )
+        return core.workspace.to_dict(workspace), 200
 
-        core.accounts.request_account_reactivation(
-            owner_account_id=owner_account_id,
-            account_id=account_id
-        )
+    except ValueError:
+        return WORKSPACE_NOT_FOUND_ERROR_DATA, 404
 
-        return {
-            "status": "reactivation_requested",
-            "account_id": str(account_id)
-        }, 202
+    except WorkspaceNotFoundError:
+        return WORKSPACE_NOT_FOUND_ERROR_DATA, 404
 
     except Exception as e:
-        logger.exception("Account reactivation failed")
+        logger.exception("Unexpected error in workspace_activate: %s", e)
 
         return {
             "error": {
-                "code": "DVZ-ACCOUNT-REACTIVATE-FAILED",
-                "message": str(e),
-                "statusCode": "500"
-            }
-        }, 500
-
-
-def accounts_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """Delete an account and all its workspaces"""
-
-    core = get_core(current_app)
-
-    try:
-        account_id = UUID(kwargs.get("account_id"))
-        owner_account_id = UUID(str(get_current_account_id()))
-
-        logger.info(
-            f"Requesting deletion for account_id={account_id} "
-            f"by owner_account_id={owner_account_id}"
-        )
-
-        core.accounts.request_account_deletion(
-            owner_account_id=owner_account_id,
-            account_id=account_id
-        )
-
-        return {
-            "status": "deletion_requested",
-            "account_id": str(account_id)
-        }, 202
-
-    except Exception as e:
-        logger.exception("Account deletion failed")
-
-        return {
-            "error": {
-                "code": "DVZ-ACCOUNT-DELETE-FAILED",
+                "code": "DVZ-WORKSPACE-ACTIVATE-FAILED",
                 "message": str(e),
                 "statusCode": "500"
             }
@@ -171,70 +95,117 @@ def accounts_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
 ---
 
-# 3️⃣ Swagger (`api_v1.yaml`)
+# 3️⃣ Add Deactivate Workspace
 
-Add these paths.
+```python
+def workspace_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
+    """Deactivate a workspace given its identifier"""
+
+    try:
+        workspace_id = UUID(kwargs.get("workspace_id"))
+    except Exception as e:
+        raise IncorrectQueryError() from e
+
+    core = get_core(current_app)
+
+    try:
+        workspace = core.workspace.deactivate_workspace(workspace_id)
+
+        return core.workspace.to_dict(workspace), 200
+
+    except ValueError:
+        return WORKSPACE_NOT_FOUND_ERROR_DATA, 404
+
+    except WorkspaceNotFoundError:
+        return WORKSPACE_NOT_FOUND_ERROR_DATA, 404
+
+    except Exception as e:
+        logger.exception("Unexpected error in workspace_deactivate: %s", e)
+
+        return {
+            "error": {
+                "code": "DVZ-WORKSPACE-DEACTIVATE-FAILED",
+                "message": str(e),
+                "statusCode": "500"
+            }
+        }, 500
+```
 
 ---
 
-### Deactivate Account
+# 4️⃣ Swagger Endpoints
+
+These must use **workspace_id**, not account_id.
+
+### Activate
 
 ```yaml
-/v1/accounts/{account_id}/deactivate:
+/v1/workspaces/{workspace_id}/activate:
   patch:
-    summary: Deactivate account and its workspaces
-    operationId: accounts_deactivate
-    x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
+    summary: Activate workspace
+    operationId: workspace_activate
+    x-openapi-router-controller: dataviz_api.apis.v1.workspace_controller
 ```
 
----
-
-### Reactivate Account
+### Deactivate
 
 ```yaml
-/v1/accounts/{account_id}/activate:
+/v1/workspaces/{workspace_id}/deactivate:
   patch:
-    summary: Reactivate account and its workspaces
-    operationId: accounts_reactivate
-    x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
+    summary: Deactivate workspace
+    operationId: workspace_deactivate
+    x-openapi-router-controller: dataviz_api.apis.v1.workspace_controller
 ```
 
----
-
-### Delete Account
+Delete already exists:
 
 ```yaml
-/v1/accounts/{account_id}:
-  delete:
-    summary: Delete account and its workspaces
-    operationId: accounts_delete
-    x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
+DELETE /v1/workspaces/{workspace_id}
 ```
 
 ---
 
-# 4️⃣ Final Flow
+# 5️⃣ Final Flow
 
-Deactivate account:
+### Activate
 
 ```
-PATCH /v1/accounts/{account_id}/deactivate
+PATCH /workspaces/{workspace_id}/activate
         ↓
-accounts_controller.accounts_deactivate
+workspace_controller.workspace_activate
         ↓
-core.accounts.request_account_deactivation
+core.workspace.reactivate_workspace
+```
+
+### Deactivate
+
+```
+PATCH /workspaces/{workspace_id}/deactivate
         ↓
-workspace.deactivate_workspaces_by_owner_account_id
+workspace_controller.workspace_deactivate
+        ↓
+core.workspace.deactivate_workspace
+```
+
+### Delete
+
+```
+DELETE /workspaces/{workspace_id}
+        ↓
+workspace_controller.workspace_delete
+        ↓
+core.workspace.request_workspace_deletion
+        ↓
+delete_workspace()
 ```
 
 ---
 
-# 👍 Good News
-
-Your **core PR already supports this flow**.
-
-So this controller will **automatically trigger the workspace activation/deactivation logic you wrote**.
+✅ **Workspace ID only**
+✅ **Deletes everything related to that workspace**
+✅ **Matches your existing delete logic**
+✅ **No account ID required in API**
 
 ---
 
-If you want, I can also show you **one mistake in your Swagger from the screenshot that will break the routing** — it’s small but important.
+If you want, send me **one screenshot of `workspace.py` in core where `reactivate_workspace()` and `deactivate_workspace()` are defined**, and I’ll confirm **100% that the API will call the exact logic you wrote**.
