@@ -1,52 +1,153 @@
-# tests/test_construct_links.py
-import pytest
+dataviz_api/apis/v1/workspace_controller.py
 
-# adjust the import below to match where your function actually lives
-# example: from my_package.utils import construct_links
-from utils import construct_links
+from uuid import UUID
+from typing import Any, Dict, Tuple
+
+from flask import current_app
+import logging
+
+from dataviz_api.core import get_core
+from dataviz_api.errors import IncorrectQueryError
+
+logger = logging.getLogger(__name__)
 
 
-def test_no_limit_but_offset():
+def workspace_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     """
-    Covers: if not limit and offset is not None -> query = f"offset={offset}"
+    Reactivate a workspace
     """
-    res = construct_links(base_url="/v1/workspaces", limit=None, offset=5, has_next=False)
-    assert isinstance(res, dict)
-    assert "links" in res
-    # self should include only offset
-    assert res["links"]["self"] == "/v1/workspaces?offset=5"
-    # no next link because has_next is False
-    assert "next" not in res["links"]
+
+    try:
+        workspace_id = UUID(kwargs.get("workspace_id"))
+    except Exception as e:
+        raise IncorrectQueryError() from e
+
+    core = get_core(current_app)
+
+    try:
+        logger.info(f"Activating workspace {workspace_id}")
+
+        workspace = core.workspace.reactivate_workspace(workspace_id)
+
+        return {
+            "status": "activated",
+            "workspace_id": str(workspace.id)
+        }, 200
+
+    except Exception as e:
+        logger.exception("Error activating workspace")
+
+        return {
+            "error": {
+                "code": "DVZ-WORKSPACE-ACTIVATE-FAILED",
+                "message": str(e),
+                "statusCode": "500"
+            }
+        }, 500
 
 
-def test_limit_present_offset_none_has_next_true():
+def workspace_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     """
-    Covers: limit is not None branch where offset is None (self -> limit only)
-    Also covers next_offset = limit when offset is None
+    Deactivate a workspace
     """
-    res = construct_links(base_url="/v1/workspaces", limit=10, offset=None, has_next=True)
-    assert "links" in res
-    # self should include only limit
-    assert res["links"]["self"] == "/v1/workspaces?limit=10"
-    # next should be created with offset == limit (10)
-    assert "next" in res["links"]
-    assert res["links"]["next"] == "/v1/workspaces?limit=10&offset=10"
+
+    try:
+        workspace_id = UUID(kwargs.get("workspace_id"))
+    except Exception as e:
+        raise IncorrectQueryError() from e
+
+    core = get_core(current_app)
+
+    try:
+        logger.info(f"Deactivating workspace {workspace_id}")
+
+        workspace = core.workspace.deactivate_workspace(workspace_id)
+
+        return {
+            "status": "deactivated",
+            "workspace_id": str(workspace.id)
+        }, 200
+
+    except Exception as e:
+        logger.exception("Error deactivating workspace")
+
+        return {
+            "error": {
+                "code": "DVZ-WORKSPACE-DEACTIVATE-FAILED",
+                "message": str(e),
+                "statusCode": "500"
+            }
+        }, 500
 
 
-def test_limit_and_offset_present_has_next_true():
+def workspace_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     """
-    Covers: limit is not None and offset is not None,
-    next_offset = offset + limit path
+    Delete workspace
     """
-    res = construct_links(base_url="/v1/workspaces", limit=10, offset=20, has_next=True)
-    assert res["links"]["self"] == "/v1/workspaces?limit=10&offset=20"
-    # next should be offset + limit => 30
-    assert res["links"]["next"] == "/v1/workspaces?limit=10&offset=30"
+
+    try:
+        workspace_id = UUID(kwargs.get("workspace_id"))
+    except Exception as e:
+        raise IncorrectQueryError() from e
+
+    core = get_core(current_app)
+
+    try:
+        logger.info(f"Deleting workspace {workspace_id}")
+
+        workspace = core.workspace.delete_workspace(workspace_id)
+
+        return {
+            "status": "deleted",
+            "workspace_id": str(workspace.id)
+        }, 200
+
+    except Exception as e:
+        logger.exception("Error deleting workspace")
+
+        return {
+            "error": {
+                "code": "DVZ-WORKSPACE-DELETE-FAILED",
+                "message": str(e),
+                "statusCode": "500"
+            }
+        }, 500
 
 
-def test_no_limit_no_offset():
-    """
-    Covers: neither limit nor offset -> no query part at all
-    """
-    res = construct_links(base_url="/v1/workspaces", limit=None, offset=None, has_next=False)
-    assert res == {"links": {"self": "/v1/workspaces"}}
+
+api_v1.yaml
+Activate
+
+/v1/workspaces/{workspace_id}/activate:
+  patch:
+    summary: Activate workspace
+    operationId: workspace_activate
+    x-openapi-router-controller: dataviz_api.apis.v1.workspace_controller
+    tags:
+      - workspaces
+    parameters:
+      - in: path
+        name: workspace_id
+        required: true
+        schema:
+          type: string
+    responses:
+      "200":
+        description: Workspace activated
+
+Deactivate
+
+/v1/workspaces/{workspace_id}/deactivate:
+  patch:
+    summary: Deactivate workspace
+    operationId: workspace_deactivate
+    x-openapi-router-controller: dataviz_api.apis.v1.workspace_controller
+
+Delete
+
+/v1/workspaces/{workspace_id}:
+  delete:
+    summary: Delete workspace
+    operationId: workspace_delete
+    x-openapi-router-controller: dataviz_api.apis.v1.workspace_controller
+
