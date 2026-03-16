@@ -1,487 +1,282 @@
-Got it 👍 — what you want is **exactly how Swagger groups APIs**.
+Yes bro 👍 I checked both the **JIRA card** and the **documentation screenshots** you shared. I’ll simplify the **exact task you need to do** so you can execute it without confusion.
 
-In Swagger UI, sections like:
+Your JIRA task is basically:
 
-* **workspaces**
-* **grafana**
-
-come from the **`tags:` field in OpenAPI**.
-
-So to create a **new section called `accounts`**, you must:
-
-1️⃣ Define a **new tag**
-2️⃣ Use that tag in your endpoints.
+**Test PCP Database Auto-Failover in DEV by upgrading the dataplance cluster and verifying failover.**
 
 ---
 
-# 1️⃣ Add Accounts Tag (Top of api_v1.yaml)
+# What Your JIRA Task Means (Simple)
 
-At the top of `api_v1.yaml` you will see something like:
+You need to:
 
-```yaml
-tags:
-  - name: workspaces
-    description: Grafana Workspaces
-
-  - name: grafana
-    description: Grafana Image and Plugins Details
-```
-
-Add **accounts** below it:
-
-```yaml
-tags:
-  - name: workspaces
-    description: Grafana Workspaces
-
-  - name: grafana
-    description: Grafana Image and Plugins Details
-
-  - name: accounts
-    description: Account lifecycle operations
-```
-
-Now Swagger knows **there is a new section**.
+1️⃣ Create a small outage in **DEV**
+2️⃣ Shutdown the **Control Plane**
+3️⃣ Upgrade the **PCP dataplane PostgreSQL version (to 15/16/17)**
+4️⃣ Enable **Auto Failover**
+5️⃣ Restart Control Plane
+6️⃣ Test failover
+7️⃣ Document the steps
 
 ---
 
-# 2️⃣ Add Accounts Endpoints
+# Full Step-by-Step Execution
 
-Add these under `paths:`.
+## Step 1 — Verify if AutoFailover already exists
 
-### Deactivate Account
+Before doing anything check this.
 
-```yaml
-/v1/accounts/{account_id}/deactivate:
-  patch:
-    tags:
-      - accounts
-    summary: Deactivate account
-    operationId: account_deactivate
-    x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
+Call:
 
-    parameters:
-      - name: account_id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-
-    responses:
-      "200":
-        description: Account deactivated
-      default:
-        description: Unexpected error
 ```
+GET /applications/{application-id}
+```
+
+Look inside response:
+
+```
+dataplaneClusters.autoFailover
+```
+
+If it says:
+
+```
+autoFailover : true
+```
+
+➡ Already enabled
+➡ No upgrade required
+
+If:
+
+```
+autoFailover : false
+```
+
+➡ Continue with upgrade
 
 ---
 
-### Activate Account
+# Step 2 — Shutdown Control Plane
 
-```yaml
-/v1/accounts/{account_id}/activate:
-  patch:
-    tags:
-      - accounts
-    summary: Reactivate account
-    operationId: account_activate
-    x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
+Doc says you must **stop control plane during upgrade**.
 
-    parameters:
-      - name: account_id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
+Send this API:
 
-    responses:
-      "200":
-        description: Account activated
-      default:
-        description: Unexpected error
 ```
+PATCH /applications/{application-id}/environment/{environment-id}
+```
+
+Payload:
+
+```json
+{
+  "options": {
+    "kube": {
+      "webserver": {
+        "replicas": 0
+      },
+      "async": {
+        "replicas": 0
+      }
+    }
+  }
+}
+```
+
+This will:
+
+* Stop webserver pods
+* Stop async workers
+
+👉 Basically **Control Plane OFF**
+
+Then redeploy the last artifact.
 
 ---
 
-### Delete Account
+# Step 3 — Upgrade PostgreSQL (Dataplane)
 
-```yaml
-/v1/accounts/{account_id}:
-  delete:
-    tags:
-      - accounts
-    summary: Delete account
-    operationId: account_delete
-    x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
+Now upgrade PostgreSQL cluster.
 
-    parameters:
-      - name: account_id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
+API:
 
-    responses:
-      "200":
-        description: Account deletion requested
-      default:
-        description: Unexpected error
 ```
+PATCH /applications/{application-id}
+```
+
+Payload:
+
+```json
+{
+  "options": {
+    "dataplane": {
+      "pgVersion": "17",
+      "envType": "nonprd"
+    }
+  }
+}
+```
+
+This will:
+
+* Upgrade PostgreSQL
+* Enable auto failover support
+
+⏱ Downtime: ~30 minutes
 
 ---
 
-# 3️⃣ Result in Swagger UI
+# Step 4 — Wait Until Upgrade Completes
 
-After restarting API:
-
-```
-Accounts
-   PATCH /accounts/{account_id}/deactivate
-   PATCH /accounts/{account_id}/activate
-   DELETE /accounts/{account_id}
-```
-
-So your Swagger will look like:
+Check status:
 
 ```
-workspaces
-grafana
-accounts   ← new section
+GET /applications/{application-id}
 ```
 
-Exactly like you wanted.
-
----
-
-# 4️⃣ Restart API
-
-After editing yaml:
-
-```bash
-make run
-```
-
-or
-
-```bash
-python app.py
-```
-
-Refresh:
+Look for:
 
 ```
-http://127.0.0.1:5000/v1/documentation
+status: ACTIVE
+```
+
+Check:
+
+```
+dataplaneCluster.version
+```
+
+Example:
+
+```
+pgVersion : 17
 ```
 
 ---
 
-# 5️⃣ Small Tip (Important)
+# Step 5 — Restart Control Plane
 
-Make sure your path **matches existing pattern**.
-
-Your repo uses:
+Now restore replicas.
 
 ```
-/v1/workspaces/*
+PATCH /applications/{application-id}/environment/{environment-id}
 ```
 
-So accounts should be:
+Payload:
+
+```json
+{
+  "options": {
+    "kube": {
+      "webserver": {
+        "replicas": 3
+      },
+      "async": {
+        "replicas": 3
+      }
+    }
+  }
+}
+```
+
+Redeploy artifact again.
+
+---
+
+# Step 6 — Verify AutoFailover
+
+Again check:
 
 ```
-/v1/accounts/*
+GET /applications/{application-id}
 ```
 
-not
+Confirm:
 
 ```
-/accounts/*
+autoFailover : true
 ```
 
 ---
 
-If you want, I can also show you a **very small change that will make your PR cleaner and easier for your lead to approve** (it's something senior backend engineers always do).
+# Step 7 — Test Failover
 
+Now simulate outage.
 
-You're correct now 👍 — and your screenshots confirm exactly how it should work.
+Possible tests:
 
-Your **core layer already provides the lifecycle functions**, so the **API should only trigger them**, not re-implement logic.
+* Kill primary DB pod
+* Stop primary node
+* Trigger failover manually
 
-From your screenshots inside
-`dataviz_core/services/accounts.py` you have:
+Then verify:
 
-1️⃣ `request_account_deactivation(...)`
-2️⃣ `request_account_reactivation(...)`
-3️⃣ `request_account_deletion(...)`
-
-These are **the exact functions the API must call**.
-
-So the API controller should be **very thin** and just forward the request.
+* Replica becomes **primary**
+* Application reconnects automatically
 
 ---
 
-# 1️⃣ Correct API Controller
+# Step 8 — Update JIRA Documentation
 
-Create / update:
+Add:
+
+✔ Steps performed
+✔ Version upgraded
+✔ Failover test result
+✔ Logs/screenshots
+
+---
+
+# Example JIRA Comment (You Can Use)
 
 ```
-dataviz_api/apis/v1/accounts_controller.py
-```
+Performed PCP dataplane upgrade to PostgreSQL 17 in DEV environment.
 
-Copy-paste this final version:
+Steps executed:
+1. Verified current cluster configuration
+2. Shutdown control plane by setting replicas to 0
+3. Upgraded dataplane PostgreSQL version
+4. Waited for application status to become ACTIVE
+5. Restarted control plane
+6. Verified autoFailover configuration
+7. Simulated failover and validated successful promotion of replica
 
-```python
-from typing import Tuple, Dict, Any
-from uuid import UUID
+Result:
+AutoFailover enabled and functioning correctly in DEV environment.
 
-from flask import current_app
-
-from dataviz_api.apis.v1.utils import get_core
-from dataviz_api.apis.v1.utils import get_current_account_id
-
-
-def account_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """Deactivate an account"""
-
-    core = get_core(current_app)
-
-    try:
-        account_id = UUID(kwargs.get("account_id"))
-        owner_account_id = get_current_account_id()
-
-        account = core.accounts.request_account_deactivation(
-            owner_account_id=owner_account_id,
-            account_id=account_id
-        )
-
-        return core.accounts.to_dict(account), 200
-
-    except Exception as e:
-        return {"error": str(e)}, 500
-
-
-def account_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """Reactivate an account"""
-
-    core = get_core(current_app)
-
-    try:
-        account_id = UUID(kwargs.get("account_id"))
-        owner_account_id = get_current_account_id()
-
-        account = core.accounts.request_account_reactivation(
-            owner_account_id=owner_account_id,
-            account_id=account_id
-        )
-
-        return core.accounts.to_dict(account), 200
-
-    except Exception as e:
-        return {"error": str(e)}, 500
-
-
-def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """Delete an account"""
-
-    core = get_core(current_app)
-
-    try:
-        account_id = UUID(kwargs.get("account_id"))
-        owner_account_id = get_current_account_id()
-
-        account = core.accounts.request_account_deletion(
-            owner_account_id=owner_account_id,
-            account_id=account_id
-        )
-
-        return core.accounts.to_dict(account), 200
-
-    except Exception as e:
-        return {"error": str(e)}, 500
+Documentation prepared for step-by-step process.
 ```
 
 ---
 
-# 2️⃣ Swagger (api_v1.yaml)
+# ⚠️ Two Important Warnings From Doc
 
-Add a **new accounts section**.
+1️⃣ **Do NOT upgrade RabbitMQ and DB at same time**
 
----
+2️⃣ Ensure you have scopes:
 
-## Deactivate Account
-
-```yaml
-/v1/accounts/{account_id}/deactivate:
-  patch:
-    summary: Deactivate account
-    operationId: account_deactivate
-    x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
-
-    tags:
-      - accounts
-
-    parameters:
-      - name: account_id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-
-    responses:
-      "200":
-        description: Account deactivated
-      default:
-        description: Unexpected error
+```
+ccp:read
+ccp:write
 ```
 
 ---
 
-## Reactivate Account
+# My Advice (As a DBA 👍)
 
-```yaml
-/v1/accounts/{account_id}/activate:
-  patch:
-    summary: Reactivate account
-    operationId: account_activate
-    x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
+Before upgrade confirm:
 
-    tags:
-      - accounts
-
-    parameters:
-      - name: account_id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-
-    responses:
-      "200":
-        description: Account activated
-      default:
-        description: Unexpected error
-```
+* replication healthy
+* backup exists
+* no active deployments
 
 ---
 
-## Delete Account
+# If you want, I can also explain
 
-```yaml
-/v1/accounts/{account_id}:
-  delete:
-    summary: Delete account
-    operationId: account_delete
-    x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
+* **How PCP failover actually works internally**
+* **How to safely trigger failover test**
+* **How to write a very strong JIRA documentation**
 
-    tags:
-      - accounts
-
-    parameters:
-      - name: account_id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-
-    responses:
-      "200":
-        description: Account deletion requested
-      default:
-        description: Unexpected error
-```
-
----
-
-# 3️⃣ What Will Happen Internally
-
-Example flow:
-
-```
-PATCH /v1/accounts/{account_id}/deactivate
-```
-
-↓
-
-```
-accounts_controller.account_deactivate()
-```
-
-↓
-
-```
-core.accounts.request_account_deactivation()
-```
-
-↓
-
-```
-Find workspaces linked to account
-Shutdown workspaces
-Update account status
-```
-
-Exactly matching your architecture slide.
-
----
-
-# 4️⃣ Why This Is Correct
-
-Your core already implements:
-
-```
-request_account_deactivation()
-request_account_reactivation()
-request_account_deletion()
-```
-
-So API must **only trigger them**, not recreate logic.
-
-This keeps:
-
-✅ **Core = business logic**
-✅ **API = transport layer**
-
-Which is exactly how **Dataviz architecture is designed**.
-
----
-
-# 5️⃣ One Important Detail
-
-You noticed this correctly in the screenshot:
-
-```
-owner_account_id
-account_id
-```
-
-So API must pass **both**, and we obtain owner using:
-
-```
-get_current_account_id()
-```
-
----
-
-# 6️⃣ What Your PR Will Look Like
-
-Files changed:
-
-```
-dataviz_api/apis/v1/accounts_controller.py   ← new
-dataviz_api/specifications/api_v1.yaml       ← new endpoints
-```
-
-Core stays untouched.
-
----
-
-✅ Your understanding is **now 100% aligned with the repo design**.
-
----
-
-If you want, I can also show you **one improvement your lead will definitely like in the PR review** (it's a small change but very senior-level).
+Just tell me bro. This task is actually **very easy once you see the flow.**
