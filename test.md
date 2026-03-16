@@ -1,105 +1,48 @@
-Yes bro 👍 I checked both the **JIRA card** and the **documentation screenshots** you shared. I’ll simplify the **exact task you need to do** so you can execute it without confusion.
-
-Your JIRA task is basically:
-
-**Test PCP Database Auto-Failover in DEV by upgrading the dataplance cluster and verifying failover.**
+Great bro 👍 since **outage is already created**, here is the **clean exact step-by-step procedure** you should follow now. I’ll structure it so you can **execute + document in JIRA easily**.
 
 ---
 
-# What Your JIRA Task Means (Simple)
+# PCP Auto-Failover Onboarding – Correct Steps
 
-You need to:
+## 1️⃣ Verify Current Cluster Status
 
-1️⃣ Create a small outage in **DEV**
-2️⃣ Shutdown the **Control Plane**
-3️⃣ Upgrade the **PCP dataplane PostgreSQL version (to 15/16/17)**
-4️⃣ Enable **Auto Failover**
-5️⃣ Restart Control Plane
-6️⃣ Test failover
-7️⃣ Document the steps
+First confirm the cluster state.
 
----
-
-# Full Step-by-Step Execution
-
-## Step 1 — Verify if AutoFailover already exists
-
-Before doing anything check this.
-
-Call:
+Run:
 
 ```
 GET /applications/{application-id}
 ```
 
-Look inside response:
+Check in response:
 
 ```
-dataplaneClusters.autoFailover
+dataplaneClusters
 ```
 
-If it says:
+Expected (your current state):
 
 ```
-autoFailover : true
+version: 17
+status: ACTIVE
+autoFailover: false
+envType: nonprd
 ```
 
-➡ Already enabled
-➡ No upgrade required
+Meaning:
 
-If:
+✔ PostgreSQL 17 running
+❌ AutoFailover not enabled yet
 
-```
-autoFailover : false
-```
-
-➡ Continue with upgrade
+Take **screenshot for Jira proof**.
 
 ---
 
-# Step 2 — Shutdown Control Plane
+# 2️⃣ Enable AutoFailover
 
-Doc says you must **stop control plane during upgrade**.
+Your teammate confirmed you must **patch the application (not environment)**.
 
-Send this API:
-
-```
-PATCH /applications/{application-id}/environment/{environment-id}
-```
-
-Payload:
-
-```json
-{
-  "options": {
-    "kube": {
-      "webserver": {
-        "replicas": 0
-      },
-      "async": {
-        "replicas": 0
-      }
-    }
-  }
-}
-```
-
-This will:
-
-* Stop webserver pods
-* Stop async workers
-
-👉 Basically **Control Plane OFF**
-
-Then redeploy the last artifact.
-
----
-
-# Step 3 — Upgrade PostgreSQL (Dataplane)
-
-Now upgrade PostgreSQL cluster.
-
-API:
+Use:
 
 ```
 PATCH /applications/{application-id}
@@ -111,7 +54,7 @@ Payload:
 {
   "options": {
     "dataplane": {
-      "pgVersion": "17",
+      "autoFailover": true,
       "envType": "nonprd"
     }
   }
@@ -120,163 +63,181 @@ Payload:
 
 This will:
 
-* Upgrade PostgreSQL
-* Enable auto failover support
+• Enable PCP failover manager
+• Activate replica monitoring
+• Allow automatic promotion
 
-⏱ Downtime: ~30 minutes
+Execute in **Swagger UI**.
 
 ---
 
-# Step 4 — Wait Until Upgrade Completes
+# 3️⃣ Wait for Configuration Update
 
-Check status:
+Give it **1–2 minutes**.
+
+Then verify again:
 
 ```
 GET /applications/{application-id}
 ```
 
-Look for:
+Now it should show:
 
 ```
+version: 17
 status: ACTIVE
+autoFailover: true
 ```
 
-Check:
+Take **another screenshot**.
 
-```
-dataplaneCluster.version
-```
+---
+
+# 4️⃣ Validate Failover
+
+Now you must confirm the feature actually works.
+
+Possible validation methods (depends on your access):
+
+### Method A (Most common)
+
+Restart the **primary DB pod**.
 
 Example:
 
 ```
-pgVersion : 17
+kubectl delete pod <primary-db-pod>
+```
+
+or restart DB instance.
+
+---
+
+### Expected Behaviour
+
+```
+Primary node fails
+↓
+Replica detected
+↓
+Replica promoted automatically
+↓
+Application reconnects
+```
+
+Failover time usually:
+
+```
+10–30 seconds
 ```
 
 ---
 
-# Step 5 — Restart Control Plane
+# 5️⃣ Validate Application Connectivity
 
-Now restore replicas.
+Check:
 
-```
-PATCH /applications/{application-id}/environment/{environment-id}
-```
-
-Payload:
-
-```json
-{
-  "options": {
-    "kube": {
-      "webserver": {
-        "replicas": 3
-      },
-      "async": {
-        "replicas": 3
-      }
-    }
-  }
-}
-```
-
-Redeploy artifact again.
+✔ Application running
+✔ No DB connection errors
+✔ Queries working normally
 
 ---
 
-# Step 6 — Verify AutoFailover
+# 6️⃣ Close the Outage
 
-Again check:
+Since you already created outage earlier:
+
+Notify team that **activity completed**.
+
+Example message:
 
 ```
-GET /applications/{application-id}
+Maintenance activity completed.
+
+PCP auto-failover has been successfully enabled
+for the DEV dataplane cluster.
+
+Cluster Version: PostgreSQL 17
+AutoFailover: Enabled
+
+Failover validation completed successfully.
+Services are fully operational.
 ```
 
-Confirm:
+---
+
+# 7️⃣ Update the JIRA Ticket
+
+Add final documentation.
+
+Example comment:
+
+```
+PCP auto-failover onboarding completed in DEV environment.
+
+Steps performed:
+1. Verified dataplane cluster configuration
+2. Confirmed PostgreSQL 17 cluster active
+3. Enabled autoFailover using application patch API
+4. Verified cluster status after configuration update
+5. Performed failover validation by simulating primary node failure
+6. Confirmed automatic replica promotion
+7. Validated application connectivity post failover
+
+Result:
+Auto failover is functioning correctly for the DEV dataplane cluster.
+```
+
+---
+
+# Visual Flow of What You Just Did
+
+```
+Old State
+PG17 ACTIVE
+AutoFailover = false
+
+        ↓
+
+PATCH application
+
+        ↓
+
+New State
+PG17 ACTIVE
+AutoFailover = true
+
+        ↓
+
+Failover Test
+
+        ↓
+
+Replica becomes primary automatically
+```
+
+---
+
+# Important Tip (Senior Engineer Trick)
+
+Before closing the ticket attach **3 screenshots**:
+
+1️⃣ Before change
+
+```
+autoFailover : false
+```
+
+2️⃣ Patch request executed
+
+3️⃣ After change
 
 ```
 autoFailover : true
 ```
 
----
-
-# Step 7 — Test Failover
-
-Now simulate outage.
-
-Possible tests:
-
-* Kill primary DB pod
-* Stop primary node
-* Trigger failover manually
-
-Then verify:
-
-* Replica becomes **primary**
-* Application reconnects automatically
+That makes the **JIRA look very professional**.
 
 ---
 
-# Step 8 — Update JIRA Documentation
-
-Add:
-
-✔ Steps performed
-✔ Version upgraded
-✔ Failover test result
-✔ Logs/screenshots
-
----
-
-# Example JIRA Comment (You Can Use)
-
-```
-Performed PCP dataplane upgrade to PostgreSQL 17 in DEV environment.
-
-Steps executed:
-1. Verified current cluster configuration
-2. Shutdown control plane by setting replicas to 0
-3. Upgraded dataplane PostgreSQL version
-4. Waited for application status to become ACTIVE
-5. Restarted control plane
-6. Verified autoFailover configuration
-7. Simulated failover and validated successful promotion of replica
-
-Result:
-AutoFailover enabled and functioning correctly in DEV environment.
-
-Documentation prepared for step-by-step process.
-```
-
----
-
-# ⚠️ Two Important Warnings From Doc
-
-1️⃣ **Do NOT upgrade RabbitMQ and DB at same time**
-
-2️⃣ Ensure you have scopes:
-
-```
-ccp:read
-ccp:write
-```
-
----
-
-# My Advice (As a DBA 👍)
-
-Before upgrade confirm:
-
-* replication healthy
-* backup exists
-* no active deployments
-
----
-
-# If you want, I can also explain
-
-* **How PCP failover actually works internally**
-* **How to safely trigger failover test**
-* **How to write a very strong JIRA documentation**
-
-Just tell me bro. This task is actually **very easy once you see the flow.**
+If you want, I can also show you one **very small thing most engineers miss in this task** that could save you from **a production incident later**. It’s a **real DBA trick.**
