@@ -1,153 +1,17 @@
-dataviz_api/apis/v1/workspace_controller.py
+Planned DEV Outage
 
-from uuid import UUID
-from typing import Any, Dict, Tuple
+Activity: PCP Dataplane PostgreSQL Upgrade & AutoFailover Enablement
+Environment: DEV (NonPRD)
+Duration: ~30 minutes
 
-from flask import current_app
-import logging
+Impact:
+DEV environment may be temporarily unavailable while the control plane is stopped and dataplane upgrade is performed.
 
-from dataviz_api.core import get_core
-from dataviz_api.errors import IncorrectQueryError
+Steps:
+- Shutdown control plane
+- Upgrade dataplane cluster
+- Enable auto failover
+- Restart control plane
+- Validate service health
 
-logger = logging.getLogger(__name__)
-
-
-def workspace_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """
-    Reactivate a workspace
-    """
-
-    try:
-        workspace_id = UUID(kwargs.get("workspace_id"))
-    except Exception as e:
-        raise IncorrectQueryError() from e
-
-    core = get_core(current_app)
-
-    try:
-        logger.info(f"Activating workspace {workspace_id}")
-
-        workspace = core.workspace.reactivate_workspace(workspace_id)
-
-        return {
-            "status": "activated",
-            "workspace_id": str(workspace.id)
-        }, 200
-
-    except Exception as e:
-        logger.exception("Error activating workspace")
-
-        return {
-            "error": {
-                "code": "DVZ-WORKSPACE-ACTIVATE-FAILED",
-                "message": str(e),
-                "statusCode": "500"
-            }
-        }, 500
-
-
-def workspace_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """
-    Deactivate a workspace
-    """
-
-    try:
-        workspace_id = UUID(kwargs.get("workspace_id"))
-    except Exception as e:
-        raise IncorrectQueryError() from e
-
-    core = get_core(current_app)
-
-    try:
-        logger.info(f"Deactivating workspace {workspace_id}")
-
-        workspace = core.workspace.deactivate_workspace(workspace_id)
-
-        return {
-            "status": "deactivated",
-            "workspace_id": str(workspace.id)
-        }, 200
-
-    except Exception as e:
-        logger.exception("Error deactivating workspace")
-
-        return {
-            "error": {
-                "code": "DVZ-WORKSPACE-DEACTIVATE-FAILED",
-                "message": str(e),
-                "statusCode": "500"
-            }
-        }, 500
-
-
-def workspace_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """
-    Delete workspace
-    """
-
-    try:
-        workspace_id = UUID(kwargs.get("workspace_id"))
-    except Exception as e:
-        raise IncorrectQueryError() from e
-
-    core = get_core(current_app)
-
-    try:
-        logger.info(f"Deleting workspace {workspace_id}")
-
-        workspace = core.workspace.delete_workspace(workspace_id)
-
-        return {
-            "status": "deleted",
-            "workspace_id": str(workspace.id)
-        }, 200
-
-    except Exception as e:
-        logger.exception("Error deleting workspace")
-
-        return {
-            "error": {
-                "code": "DVZ-WORKSPACE-DELETE-FAILED",
-                "message": str(e),
-                "statusCode": "500"
-            }
-        }, 500
-
-
-
-api_v1.yaml
-Activate
-
-/v1/workspaces/{workspace_id}/activate:
-  patch:
-    summary: Activate workspace
-    operationId: workspace_activate
-    x-openapi-router-controller: dataviz_api.apis.v1.workspace_controller
-    tags:
-      - workspaces
-    parameters:
-      - in: path
-        name: workspace_id
-        required: true
-        schema:
-          type: string
-    responses:
-      "200":
-        description: Workspace activated
-
-Deactivate
-
-/v1/workspaces/{workspace_id}/deactivate:
-  patch:
-    summary: Deactivate workspace
-    operationId: workspace_deactivate
-    x-openapi-router-controller: dataviz_api.apis.v1.workspace_controller
-
-Delete
-
-/v1/workspaces/{workspace_id}:
-  delete:
-    summary: Delete workspace
-    operationId: workspace_delete
-    x-openapi-router-controller: dataviz_api.apis.v1.workspace_controller
-
+Will notify once activity is completed.
