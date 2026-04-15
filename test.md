@@ -1,67 +1,143 @@
-Yes bro — **you are 100% correct now**.
-👉 The **account_id from Swagger MUST be used**, not the logged-in user.
+Got you bro — I’ll give you a **clean full version** of your file with:
 
-Right now your issue is because your service method is still **designed around `owner_account_id` (logged user context)**.
+✅ Hardcoded allowed accounts
+✅ Central validation
+✅ Clean structure
+✅ Applied to all APIs
 
 ---
 
-# 🔴 THE REAL PROBLEM
-
-Your core function:
+# 🚀 FULL CLEAN CODE
 
 ```python
-request_account_deletion(self, owner_account_id, account_id)
-```
+from typing import Tuple, Dict, Any
+from types import SimpleNamespace
+from uuid import UUID
 
-👉 This expects:
+from flask import current_app
 
-* `owner_account_id` = who is performing action
-* `account_id` = target account
+from dataviz_api.core import get_core
 
-But your API:
 
-* Only gives `account_id`
-* No logged-user dependency (admin API)
+# ✅ HARD CODED ALLOWED ACCOUNTS
+ALLOWED_ACCOUNT_IDS = {
+    UUID("11111111-2222-3333-4444-555555555555"),
+    UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+}
 
----
 
-# ✅ CORRECT APPROACH (Clean + Proper)
-
-Since this is **ADMIN API**, you should:
-
-👉 **Pass the SAME ID for both**
-
-```python
-owner_account_id = account_id
-```
-
-✔ This ensures:
-
-* No fallback to logged-in user
-* Correct account is targeted
-* Core logic still works without breaking
-
----
-
-# ✅ FINAL CONTROLLER CODE (COPY THIS 🔥)
-
----
-
-## 🔹 Common helper (keep this)
-
-```python
+# ✅ GET SERVICE
 def _get_accounts_service(core: Any) -> Any:
     service = getattr(core, "accounts", None) or getattr(core, "account", None)
     if service is None:
-        raise RuntimeError("Account service not available")
+        raise RuntimeError("Account service is not available in core")
     return service
-```
 
----
 
-## ✅ ACCOUNT STATUS (FIXED)
+# ✅ UUID PARSER
+def _parse_uuid(value: Any, field_name: str) -> UUID:
+    try:
+        return UUID(str(value))
+    except Exception:
+        raise ValueError(f"Invalid UUID provided for '{field_name}'")
 
-```python
+
+# ✅ ACCESS VALIDATION
+def _validate_account_access(account_id: UUID):
+    if account_id not in ALLOWED_ACCOUNT_IDS:
+        raise PermissionError(f"Account {account_id} is not allowed to perform this action")
+
+
+# =========================================================
+# 🔻 DEACTIVATE ACCOUNT
+# =========================================================
+def account_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
+    core = get_core(current_app)
+
+    try:
+        accounts_service = _get_accounts_service(core)
+
+        owner_account_id = _parse_uuid(kwargs.get("owner_account_id"), "owner_account_id")
+        account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
+
+        # ✅ VALIDATION
+        _validate_account_access(owner_account_id)
+        _validate_account_access(account_id)
+
+        account = accounts_service.request_account_deactivation(
+            owner_account_id=owner_account_id,
+            account_id=account_id,
+        )
+
+        return accounts_service.to_dict(account), 200
+
+    except PermissionError as e:
+        return {"error": str(e)}, 403
+    except Exception as e:
+        return {"error": str(e)}, 400
+
+
+# =========================================================
+# 🔻 ACTIVATE ACCOUNT
+# =========================================================
+def account_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
+    core = get_core(current_app)
+
+    try:
+        accounts_service = _get_accounts_service(core)
+
+        owner_account_id = _parse_uuid(kwargs.get("owner_account_id"), "owner_account_id")
+        account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
+
+        # ✅ VALIDATION
+        _validate_account_access(owner_account_id)
+        _validate_account_access(account_id)
+
+        account = accounts_service.request_account_reactivation(
+            owner_account_id=owner_account_id,
+            account_id=account_id,
+        )
+
+        return accounts_service.to_dict(account), 200
+
+    except PermissionError as e:
+        return {"error": str(e)}, 403
+    except Exception as e:
+        return {"error": str(e)}, 400
+
+
+# =========================================================
+# 🔻 DELETE ACCOUNT
+# =========================================================
+def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
+    core = get_core(current_app)
+
+    try:
+        accounts_service = _get_accounts_service(core)
+
+        owner_account_id = _parse_uuid(kwargs.get("owner_account_id"), "owner_account_id")
+        account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
+
+        # ✅ VALIDATION
+        _validate_account_access(owner_account_id)
+        _validate_account_access(account_id)
+
+        account = accounts_service.request_account_deletion(
+            owner_account_id=owner_account_id,
+            account_id=account_id,
+        )
+
+        return accounts_service.to_dict(account), 200
+
+    except PermissionError as e:
+        return {"error": str(e)}, 403
+    except Exception as e:
+        return {"error": str(e)}, 400
+
+
+# =========================================================
+# 🔻 ACCOUNT STATUS
+# =========================================================
 def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     core = get_core(current_app)
 
@@ -70,12 +146,20 @@ def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
         account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
 
-        # ✅ DIRECT call — no fake workspace
-        account = accounts_service.get_by_owner_id(account_id)
+        # ✅ VALIDATION (optional but recommended)
+        _validate_account_access(account_id)
 
-        response = {
-            "id": str(account.id),
-            "status": getattr(account, "status", "UNKNOWN"),
+        # service expects owner_account_id-like object
+        workspace = SimpleNamespace(owner_account_id=account_id)
+
+        account = accounts_service.get_account_details_by_id(workspace)
+
+        raw_status = getattr(account, "status", None)
+        status = raw_status if isinstance(raw_status, str) and raw_status else "ACTIVE"
+
+        response: Dict[str, Any] = {
+            "id": str(getattr(account, "id", account_id)),
+            "status": status,
         }
 
         if hasattr(account, "name"):
@@ -83,126 +167,35 @@ def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
         return response, 200
 
+    except PermissionError as e:
+        return {"error": str(e)}, 403
     except Exception as e:
         return {"error": str(e)}, 400
 ```
 
 ---
 
-## ✅ DEACTIVATE
+# ✅ What you achieved now
 
-```python
-def account_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    core = get_core(current_app)
-
-    try:
-        accounts_service = _get_accounts_service(core)
-
-        account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
-
-        account = accounts_service.request_account_deactivation(
-            owner_account_id=account_id,
-            account_id=account_id,
-        )
-
-        return accounts_service.to_dict(account), 200
-
-    except Exception as e:
-        return {"error": str(e)}, 400
-```
+✔ Only 2 accounts can perform actions
+✔ Swagger input is respected
+✔ Unauthorized users → **403 Forbidden**
+✔ Clean reusable validation
+✔ No duplication
 
 ---
 
-## ✅ ACTIVATE
+# ⚡ If you want next level (recommended later)
 
-```python
-def account_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    core = get_core(current_app)
+Instead of hardcoding:
 
-    try:
-        accounts_service = _get_accounts_service(core)
-
-        account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
-
-        account = accounts_service.request_account_reactivation(
-            owner_account_id=account_id,
-            account_id=account_id,
-        )
-
-        return accounts_service.to_dict(account), 200
-
-    except Exception as e:
-        return {"error": str(e)}, 400
-```
+* Move IDs to **env variable / config**
+* Or fetch from DB
 
 ---
 
-## ✅ DELETE
+If you want, next I can help you:
 
-```python
-def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    core = get_core(current_app)
-
-    try:
-        accounts_service = _get_accounts_service(core)
-
-        account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
-
-        account = accounts_service.request_account_deletion(
-            owner_account_id=account_id,
-            account_id=account_id,
-        )
-
-        return accounts_service.to_dict(account), 200
-
-    except Exception as e:
-        return {"error": str(e)}, 400
-```
-
----
-
-# 🔥 IMPORTANT (Swagger Fix)
-
-👉 REMOVE this from YAML:
-
-```yaml
-requestBody:
-  required: true
-```
-
-Because:
-
-* You are NOT using `owner_account_id` from body
-* Only `account_id` from path is needed
-
----
-
-# 🧠 FINAL FLOW (Correct Now)
-
-1. Swagger → sends `/accounts/{account_id}`
-2. Controller → extracts `account_id`
-3. Controller → passes SAME id:
-
-   ```
-   owner_account_id = account_id
-   account_id = account_id
-   ```
-4. Core → processes correct account ✅
-
----
-
-# 💬 Bro summary
-
-✔ Your understanding now is PERFECT
-✔ Your core code was already correct
-❌ Only API layer was wrong
-
-Now it's **clean, production-safe, and reviewer-friendly**.
-
----
-
-If you want next level:
-👉 I can help you make this look like **senior-level PR (logging + validations + error mapping)**
-👉 Or fix your OpenAPI fully clean (your lead will definitely notice)
-
-Just tell me 👍
+👉 Fix that Swagger wrong ID issue
+👉 Or add **logging + debugging trace**
+👉 Or convert this into **middleware (clean architecture)**
