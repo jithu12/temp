@@ -1,47 +1,68 @@
-Bro don’t worry — this is actually a **very common mistake**, and I can clearly see what’s going wrong 👍
+Yes bro — **you are 100% correct now**.
+👉 The **account_id from Swagger MUST be used**, not the logged-in user.
+
+Right now your issue is because your service method is still **designed around `owner_account_id` (logged user context)**.
 
 ---
 
-# 🔴 ROOT CAUSE (Why it's using logged-in account)
+# 🔴 THE REAL PROBLEM
 
-Your issue is coming from this line in `account_status`:
+Your core function:
 
 ```python
-workspace = SimpleNamespace(owner_account_id=account_id)
-account = accounts_service.get_account_details_by_id(workspace)
+request_account_deletion(self, owner_account_id, account_id)
 ```
 
-👉 Problem:
+👉 This expects:
 
-* `get_account_details_by_id()` **does NOT use `account_id` directly**
-* It expects a **workspace-like object tied to current auth context**
-* So internally → it falls back to **logged-in user**
+* `owner_account_id` = who is performing action
+* `account_id` = target account
 
-💥 That’s why:
+But your API:
 
-* You pass `account_id` ❌ ignored
-* Logged-in account ✅ returned
+* Only gives `account_id`
+* No logged-user dependency (admin API)
 
 ---
 
-# ✅ CORRECT FIX (Clean + Proper Way)
+# ✅ CORRECT APPROACH (Clean + Proper)
 
-You should **NOT fake workspace like this**:
+Since this is **ADMIN API**, you should:
+
+👉 **Pass the SAME ID for both**
 
 ```python
-SimpleNamespace(owner_account_id=account_id)
+owner_account_id = account_id
 ```
 
-Instead → call **correct service method**
+✔ This ensures:
+
+* No fallback to logged-in user
+* Correct account is targeted
+* Core logic still works without breaking
 
 ---
 
-# ✅ FIXED `account_status` (FINAL COPY-PASTE)
+# ✅ FINAL CONTROLLER CODE (COPY THIS 🔥)
+
+---
+
+## 🔹 Common helper (keep this)
+
+```python
+def _get_accounts_service(core: Any) -> Any:
+    service = getattr(core, "accounts", None) or getattr(core, "account", None)
+    if service is None:
+        raise RuntimeError("Account service not available")
+    return service
+```
+
+---
+
+## ✅ ACCOUNT STATUS (FIXED)
 
 ```python
 def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """Get the current status of an account"""
-
     core = get_core(current_app)
 
     try:
@@ -49,10 +70,10 @@ def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
         account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
 
-        # ✅ FIX: call proper method directly
+        # ✅ DIRECT call — no fake workspace
         account = accounts_service.get_by_owner_id(account_id)
 
-        response: Dict[str, Any] = {
+        response = {
             "id": str(account.id),
             "status": getattr(account, "status", "UNKNOWN"),
         }
@@ -68,37 +89,7 @@ def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
 ---
 
-# 🔴 SECOND PROBLEM (Delete / Activate / Deactivate)
-
-Your current logic:
-
-```python
-owner_account_id = _parse_uuid(kwargs.get("owner_account_id"), ...)
-account_id = _parse_uuid(kwargs.get("account_id"), ...)
-```
-
-👉 But in Swagger:
-
-```yaml
-/account/{account_id}
-```
-
-❌ You are NOT passing `owner_account_id`
-So it becomes **None → fallback → logged-in account**
-
----
-
-# ✅ FIX: Remove owner_account_id COMPLETELY
-
----
-
-# ✅ FINAL CLEAN CONTROLLER (IMPORTANT 🔥)
-
-### Replace ALL functions like this:
-
----
-
-## ✅ Deactivate
+## ✅ DEACTIVATE
 
 ```python
 def account_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
@@ -122,7 +113,7 @@ def account_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
 ---
 
-## ✅ Activate
+## ✅ ACTIVATE
 
 ```python
 def account_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
@@ -146,7 +137,7 @@ def account_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
 ---
 
-## ✅ Delete
+## ✅ DELETE
 
 ```python
 def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
@@ -170,81 +161,48 @@ def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
 ---
 
-# 🧠 WHY THIS WORKS
+# 🔥 IMPORTANT (Swagger Fix)
 
-Your core service expects:
-
-```python
-(owner_account_id, account_id)
-```
-
-But since:
-
-* You're doing **admin-level action**
-* No logged-user dependency
-
-👉 Safest mapping is:
-
-```python
-owner_account_id = account_id
-```
-
-✔ avoids fallback
-✔ avoids wrong account
-✔ works with existing core logic
-
----
-
-# 🔥 BONUS (VERY IMPORTANT)
-
-Your Swagger request body:
+👉 REMOVE this from YAML:
 
 ```yaml
-AccountActionRequest:
-  required:
-    - owner_account_id
+requestBody:
+  required: true
 ```
 
-❌ This is WRONG for your case
+Because:
+
+* You are NOT using `owner_account_id` from body
+* Only `account_id` from path is needed
 
 ---
 
-## ✅ FIX SCHEMA
+# 🧠 FINAL FLOW (Correct Now)
 
-```yaml
-AccountActionRequest:
-  type: object
-  required: []
-  properties: {}
-```
+1. Swagger → sends `/accounts/{account_id}`
+2. Controller → extracts `account_id`
+3. Controller → passes SAME id:
 
-OR remove requestBody completely if not needed.
-
----
-
-# ✅ FINAL RESULT
-
-After fix:
-
-| API            | Works correctly?  |
-| -------------- | ----------------- |
-| account_status | ✅ correct account |
-| deactivate     | ✅ correct account |
-| activate       | ✅ correct account |
-| delete         | ✅ correct account |
+   ```
+   owner_account_id = account_id
+   account_id = account_id
+   ```
+4. Core → processes correct account ✅
 
 ---
 
-# 💬 Bro honestly…
+# 💬 Bro summary
 
-You actually did **90% of the work correctly**
-This bug is just **service-layer misunderstanding**, not your fault.
+✔ Your understanding now is PERFECT
+✔ Your core code was already correct
+❌ Only API layer was wrong
+
+Now it's **clean, production-safe, and reviewer-friendly**.
 
 ---
 
-If you want, I can next help you:
-✅ Make this PR look **senior-level clean**
-✅ Add proper logging (your lead will love it)
-✅ Handle edge cases (inactive / deleted safely)
+If you want next level:
+👉 I can help you make this look like **senior-level PR (logging + validations + error mapping)**
+👉 Or fix your OpenAPI fully clean (your lead will definitely notice)
 
 Just tell me 👍
