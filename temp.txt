@@ -1,17 +1,5 @@
-Planned DEV Outage
-
-Activity: PCP Dataplane PostgreSQL Upgrade & AutoFailover Enablement
-Environment: DEV (NonPRD)
-Duration: ~30 minutes
-
-Impact:
-DEV environment may be temporarily unavailable while the control plane is stopped and dataplane upgrade is performed.
-
-Steps:
-- Shutdown control plane
-- Upgrade dataplane cluster
-- Enable auto failover
-- Restart control plane
-- Validate service health
-
-Will notify once activity is completed.
+except Exception as e:
+    self.logger.exception(
+        f"Error retrieving AccountDetails for owner_account_id: {owner_account_id}"
+    )
+    raise AccountNotFoundException(...) from e
