@@ -1,5 +1,17 @@
-except Exception as e:
-    self.logger.exception(
-        f"Error retrieving AccountDetails for owner_account_id: {owner_account_id}"
-    )
-    raise AccountNotFoundException(...) from e
+def get_by_owner_id(self, owner_account_id: str) -> AccountDetails:
+    filters = [FilteringCriterion("owner_account_id", owner_account_id)]
+    results = self.repositories.account_details.list(filters=filters)
+    if not results:
+        self.logger.error(
+            f"AccountDetails not found for owner_account_id: {owner_account_id}"
+        )
+        raise AccountNotFoundException(
+            f"AccountDetails with owner_account_id: {owner_account_id} not found"
+        )
+    return results[0]
+
+
+
+
+
+find . -type d -name __pycache__ -exec rm -rf {} +
