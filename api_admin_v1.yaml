@@ -1,0 +1,314 @@
+openapi: 3.0.0
+
+info:
+  title: Dataviz Accounts Admin API
+  version: "0.1.0"
+  description: >
+    Admin-only account lifecycle operations for Dataviz.
+    These endpoints trigger deactivation, reactivation, and deletion
+    of accounts and their associated workspaces. Mutating endpoints
+    are restricted to a hardcoded set of admin accounts enforced in
+    the controller, with a defense-in-depth check also performed in
+    the Core service layer.
+
+servers:
+  - url: /admin/v1
+
+paths:
+
+  /accounts/{account_id}/deactivate:
+    patch:
+      summary: Request deactivation of an account
+      description: >
+        Marks the target account as INACTIVE and asynchronously
+        deactivates all its active workspaces. Caller must be one of
+        the configured admin accounts.
+      operationId: account_deactivate
+      x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountActionRequest"
+      responses:
+        "202":
+          description: Account deactivation requested
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "403":
+          description: Caller is not authorized to perform admin actions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+        "404":
+          description: Target account not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+        "409":
+          description: Account is not in a state that allows deactivation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+        default:
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+      security:
+        - oauth2_accessCode:
+            - dataviz:readwrite
+      tags:
+        - accounts
+
+  /accounts/{account_id}/activate:
+    patch:
+      summary: Request reactivation of an account
+      description: >
+        Marks the target account as ACTIVE and asynchronously
+        reactivates all its inactive workspaces. Caller must be one
+        of the configured admin accounts.
+      operationId: account_activate
+      x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountActionRequest"
+      responses:
+        "202":
+          description: Account reactivation requested
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "403":
+          description: Caller is not authorized to perform admin actions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+        "404":
+          description: Target account not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+        "409":
+          description: Account is not in a state that allows reactivation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+        default:
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+      security:
+        - oauth2_accessCode:
+            - dataviz:readwrite
+      tags:
+        - accounts
+
+  /accounts/{account_id}:
+    delete:
+      summary: Request deletion of an account
+      description: >
+        Marks the target account as DELETED and asynchronously
+        deletes all its associated workspaces. Caller must be one
+        of the configured admin accounts.
+      operationId: account_delete
+      x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountActionRequest"
+      responses:
+        "202":
+          description: Account deletion requested
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "403":
+          description: Caller is not authorized to perform admin actions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+        "404":
+          description: Target account not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+        "409":
+          description: Account is not in a state that allows deletion
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+        default:
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+      security:
+        - oauth2_accessCode:
+            - dataviz:readwrite
+      tags:
+        - accounts
+
+  /accounts/{account_id}/status:
+    get:
+      summary: Get current status of an account
+      description: >
+        Returns the current lifecycle status of the specified account.
+        Available to any authenticated user.
+      operationId: account_status
+      x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+      responses:
+        "200":
+          description: Account status retrieved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountStatus"
+        "404":
+          description: Account not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+        default:
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+      security:
+        - oauth2_accessCode:
+            - dataviz:read
+            - dataviz:readwrite
+      tags:
+        - accounts
+
+components:
+
+  parameters:
+    accountId:
+      name: account_id
+      in: path
+      required: true
+      description: >
+        The target account identifier (owner_account_id of the
+        account to act on).
+      schema:
+        type: string
+        format: uuid
+      example: 00000000-1111-2222-3333-444444444444
+
+  securitySchemes:
+    oauth2_accessCode:
+      type: oauth2
+      x-tokenInfoFunc: platform_api.token_check
+      x-scopeValidateFunc: platform_api.validate_sg_iamaas_scope
+      flows:
+        authorizationCode:
+          authorizationUrl: https://oauth2.accesscontrol.cloud.socgen/v3/oauth2/authorize
+          tokenUrl: https://oauth2.accesscontrol.cloud.socgen/v3/oauth2/access_token
+          scopes:
+            dataviz:read: Grant read access
+            dataviz:readwrite: Write scopes on resources
+            dataviz:read_resources: Grant read access to resource types
+
+  schemas:
+
+    AccountActionRequest:
+      type: object
+      description: >
+        Optional request payload for account lifecycle actions. The
+        admin caller identity is normally derived from the auth token
+        and the target is derived from the path parameter, so this
+        body is accepted for forward compatibility but its fields are
+        not required by the current implementation.
+      properties:
+        owner_account_id:
+          type: string
+          format: uuid
+          description: >
+            Optional target owner account id. If provided it should
+            match the path parameter.
+          example: 11111111-2222-3333-4444-555555555555
+
+    Account:
+      type: object
+      description: Account details returned by lifecycle operations
+      required:
+        - id
+        - status
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Account identifier
+          example: 00000000-1111-2222-3333-444444444444
+        status:
+          type: string
+          description: Account status after the operation was requested
+          example: ACTIVE
+        name:
+          type: string
+          description: Account name (if available)
+
+    AccountStatus:
+      type: object
+      description: Current status of the account
+      required:
+        - id
+        - status
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Account identifier
+        status:
+          type: string
+          description: Current account status
+          example: ACTIVE
+        name:
+          type: string
+          description: Account name (if available)
+
+    ErrorModel:
+      description: Error response
+      type: object
+      properties:
+        error:
+          type: string
+          example: An unexpected error occurred
+
+tags:
+  - name: accounts
+    description: Account lifecycle operations
