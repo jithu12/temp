@@ -16,7 +16,7 @@ servers:
 
 paths:
 
-  /accounts/{account_id}/deactivate:
+  /accounts/{target_account_id}/deactivate:
     patch:
       summary: Request deactivation of an account
       description: >
@@ -26,7 +26,7 @@ paths:
       operationId: account_deactivate
       x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
       parameters:
-        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/targetAccountId"
       requestBody:
         required: false
         content:
@@ -70,7 +70,7 @@ paths:
       tags:
         - accounts
 
-  /accounts/{account_id}/activate:
+  /accounts/{target_account_id}/activate:
     patch:
       summary: Request reactivation of an account
       description: >
@@ -80,7 +80,7 @@ paths:
       operationId: account_activate
       x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
       parameters:
-        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/targetAccountId"
       requestBody:
         required: false
         content:
@@ -124,7 +124,7 @@ paths:
       tags:
         - accounts
 
-  /accounts/{account_id}:
+  /accounts/{target_account_id}:
     delete:
       summary: Request deletion of an account
       description: >
@@ -134,7 +134,7 @@ paths:
       operationId: account_delete
       x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
       parameters:
-        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/targetAccountId"
       requestBody:
         required: false
         content:
@@ -178,7 +178,7 @@ paths:
       tags:
         - accounts
 
-  /accounts/{account_id}/status:
+  /accounts/{target_account_id}/status:
     get:
       summary: Get current status of an account
       description: >
@@ -187,7 +187,7 @@ paths:
       operationId: account_status
       x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
       parameters:
-        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/targetAccountId"
       responses:
         "200":
           description: Account status retrieved
@@ -217,13 +217,16 @@ paths:
 components:
 
   parameters:
-    accountId:
-      name: account_id
+    targetAccountId:
+      name: target_account_id
       in: path
       required: true
       description: >
         The target account identifier (owner_account_id of the
-        account to act on).
+        account to act on). Named 'target_account_id' (not
+        'account_id') to avoid kwargs collision with the caller
+        'account_id' that the auth middleware injects into the
+        handler.
       schema:
         type: string
         format: uuid
@@ -249,10 +252,9 @@ components:
       type: object
       description: >
         Optional request payload for account lifecycle actions. The
-        admin caller identity is normally derived from the auth token
-        and the target is derived from the path parameter, so this
-        body is accepted for forward compatibility but its fields are
-        not required by the current implementation.
+        admin caller identity is derived from the auth token and the
+        target is derived from the path parameter, so this body is
+        accepted for forward compatibility but not required.
       properties:
         owner_account_id:
           type: string
@@ -272,8 +274,12 @@ components:
         id:
           type: string
           format: uuid
-          description: Account identifier
+          description: Account identifier (Dataviz internal id)
           example: 00000000-1111-2222-3333-444444444444
+        owner_account_id:
+          type: string
+          format: uuid
+          description: Owner account identifier
         status:
           type: string
           description: Account status after the operation was requested
@@ -292,7 +298,11 @@ components:
         id:
           type: string
           format: uuid
-          description: Account identifier
+          description: Account identifier (Dataviz internal id)
+        owner_account_id:
+          type: string
+          format: uuid
+          description: Owner account identifier
         status:
           type: string
           description: Current account status
