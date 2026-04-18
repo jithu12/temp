@@ -1,5 +1,4 @@
 from typing import Tuple, Dict, Any
-from types import SimpleNamespace
 from uuid import UUID
 
 from flask import current_app, abort
@@ -204,6 +203,11 @@ def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
     Returns the current lifecycle status of the specified account.
     Available to any authenticated user (no admin gate).
+
+    NOTE: This uses get_by_owner_id (which queries the Dataviz DB
+    directly) rather than get_account_details_by_id (which calls
+    the external account platform client and can return the caller's
+    own account data regardless of the requested ID).
     """
     core = get_core(current_app)
 
@@ -212,10 +216,10 @@ def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
         account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
 
-        # AccountService.get_account_details_by_id expects an object
-        # exposing owner_account_id; wrap the id in a namespace.
-        workspace_like = SimpleNamespace(owner_account_id=account_id)
-        account = accounts_service.get_account_details_by_id(workspace_like)
+        # Look up the account by owner_account_id directly in the
+        # Dataviz data store. Raises AccountNotFoundException if the
+        # id does not match any existing account.
+        account = accounts_service.get_by_owner_id(str(account_id))
 
         return _account_to_response(account), 200
 
