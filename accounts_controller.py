@@ -11,8 +11,9 @@ from platform_api.permissions import get_current_account_id
 # Admin allowlist
 # --------------------------------------------------------------------------
 # Only these two accounts are permitted to invoke the mutating admin
-# endpoints (deactivate / activate / delete). The same values should be
-# configured in the Core ADMIN_ACCOUNTS env var for defense in depth.
+# endpoints (deactivate / activate / delete). The same values should
+# also be configured in the Core ADMIN_ACCOUNTS env var for defense
+# in depth.
 ALLOWED_ACCOUNT_IDS = {
     UUID("d3ac47ac-cc43-4da7-b935-d0c0b1d4c7b9"),
     UUID("3c24a85d-f148-485e-96a9-c21d47b42f54"),
@@ -55,11 +56,24 @@ def _parse_uuid(value: Any, field_name: str) -> UUID:
         raise ValueError(f"Invalid UUID provided for '{field_name}'")
 
 
+def _get_target_account_id(kwargs: Dict[str, Any]) -> UUID:
+    """
+    Extract the target account id from the path parameter. The path
+    parameter is named 'target_account_id' (not 'account_id') so that
+    it does not collide with the caller 'account_id' injected by the
+    auth middleware into kwargs.
+    """
+    raw = kwargs.get("target_account_id")
+    if raw is None:
+        raise ValueError("Missing required path parameter 'target_account_id'")
+    return _parse_uuid(raw, "target_account_id")
+
+
 def _account_to_response(account: Any) -> Dict[str, Any]:
     """
     Build the API response dict from an AccountDetails object returned
-    by Core. Core returns AccountDetails (not a dict), and its status
-    is a Status enum whose value we serialize as a string.
+    by Core. AccountDetails.status is a Status enum so we serialize
+    its .value as a string.
     """
     raw_status = getattr(account, "status", None)
     if raw_status is None:
@@ -73,6 +87,9 @@ def _account_to_response(account: Any) -> Dict[str, Any]:
         "id": str(getattr(account, "id", "")),
         "status": status,
     }
+    owner = getattr(account, "owner_account_id", None)
+    if owner is not None:
+        response["owner_account_id"] = str(owner)
     name = getattr(account, "name", None)
     if name:
         response["name"] = name
@@ -81,9 +98,8 @@ def _account_to_response(account: Any) -> Dict[str, Any]:
 
 def _handle_core_exception(e: Exception) -> Tuple[Dict[str, Any], int]:
     """
-    Map Core exceptions to appropriate HTTP status codes. Exception
-    class names are matched loosely so this works whether the Core
-    exceptions are imported here or not.
+    Map Core exceptions to HTTP status codes. Matched by class name so
+    the Core exceptions do not need to be imported here.
     """
     name = type(e).__name__
     if name == "NotOwnerError":
@@ -100,7 +116,7 @@ def _handle_core_exception(e: Exception) -> Tuple[Dict[str, Any], int]:
 # --------------------------------------------------------------------------
 def account_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     """
-    PATCH /admin/v1/accounts/{account_id}/deactivate
+    PATCH /admin/v1/accounts/{target_account_id}/deactivate
 
     Requests deactivation of the target account. The admin caller is
     identified from the auth token and must be in ALLOWED_ACCOUNT_IDS.
@@ -113,10 +129,7 @@ def account_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
         accounts_service = _get_accounts_service(core)
 
-        # Path param 'account_id' is the target's owner_account_id
-        target_owner_account_id = _parse_uuid(
-            kwargs.get("account_id"), "account_id"
-        )
+        target_owner_account_id = _get_target_account_id(kwargs)
 
         # Core contract:
         #   owner_account_id -> target account being acted on
@@ -136,7 +149,7 @@ def account_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
 def account_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     """
-    PATCH /admin/v1/accounts/{account_id}/activate
+    PATCH /admin/v1/accounts/{target_account_id}/activate
 
     Requests reactivation of the target account. The admin caller is
     identified from the auth token and must be in ALLOWED_ACCOUNT_IDS.
@@ -148,9 +161,7 @@ def account_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
         accounts_service = _get_accounts_service(core)
 
-        target_owner_account_id = _parse_uuid(
-            kwargs.get("account_id"), "account_id"
-        )
+        target_owner_account_id = _get_target_account_id(kwargs)
 
         account = accounts_service.request_account_reactivation(
             owner_account_id=target_owner_account_id,
@@ -167,7 +178,7 @@ def account_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
 def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     """
-    DELETE /admin/v1/accounts/{account_id}
+    DELETE /admin/v1/accounts/{target_account_id}
 
     Requests deletion of the target account and all its associated
     workspaces. The admin caller is identified from the auth token
@@ -180,9 +191,7 @@ def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
         accounts_service = _get_accounts_service(core)
 
-        target_owner_account_id = _parse_uuid(
-            kwargs.get("account_id"), "account_id"
-        )
+        target_owner_account_id = _get_target_account_id(kwargs)
 
         account = accounts_service.request_account_deletion(
             owner_account_id=target_owner_account_id,
@@ -199,27 +208,27 @@ def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
 def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     """
-    GET /admin/v1/accounts/{account_id}/status
+    GET /admin/v1/accounts/{target_account_id}/status
 
     Returns the current lifecycle status of the specified account.
     Available to any authenticated user (no admin gate).
 
-    NOTE: This uses get_by_owner_id (which queries the Dataviz DB
-    directly) rather than get_account_details_by_id (which calls
-    the external account platform client and can return the caller's
-    own account data regardless of the requested ID).
+    Uses get_by_owner_id (which queries the Dataviz DB directly)
+    rather than get_account_details_by_id (which calls the external
+    account platform client and can return the caller's own data
+    regardless of the requested id).
     """
     core = get_core(current_app)
 
     try:
         accounts_service = _get_accounts_service(core)
 
-        account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
+        target_account_id = _get_target_account_id(kwargs)
 
         # Look up the account by owner_account_id directly in the
         # Dataviz data store. Raises AccountNotFoundException if the
         # id does not match any existing account.
-        account = accounts_service.get_by_owner_id(str(account_id))
+        account = accounts_service.get_by_owner_id(str(target_account_id))
 
         return _account_to_response(account), 200
 
