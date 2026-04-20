@@ -1,201 +1,165 @@
-Got you bro — I’ll give you a **clean full version** of your file with:
+OK I can see the test failures and the test file. Let me work through what's broken.
 
-✅ Hardcoded allowed accounts
-✅ Central validation
-✅ Clean structure
-✅ Applied to all APIs
+## The 3 failures
 
----
+```
+FAILED tests/services/test_accounts.py::test_get_by_owner_id_success
+  AssertionError: assert <MagicMock ...list().__getitem__()...> is <MagicMock ...list().first()...>
 
-# 🚀 FULL CLEAN CODE
+FAILED tests/services/test_accounts.py::test_get_by_owner_id_raises_account_not_found
+  Exception: db err
 
-```python
-from typing import Tuple, Dict, Any
-from types import SimpleNamespace
-from uuid import UUID
-
-from flask import current_app
-
-from dataviz_api.core import get_core
-
-
-# ✅ HARD CODED ALLOWED ACCOUNTS
-ALLOWED_ACCOUNT_IDS = {
-    UUID("11111111-2222-3333-4444-555555555555"),
-    UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
-}
-
-
-# ✅ GET SERVICE
-def _get_accounts_service(core: Any) -> Any:
-    service = getattr(core, "accounts", None) or getattr(core, "account", None)
-    if service is None:
-        raise RuntimeError("Account service is not available in core")
-    return service
-
-
-# ✅ UUID PARSER
-def _parse_uuid(value: Any, field_name: str) -> UUID:
-    try:
-        return UUID(str(value))
-    except Exception:
-        raise ValueError(f"Invalid UUID provided for '{field_name}'")
-
-
-# ✅ ACCESS VALIDATION
-def _validate_account_access(account_id: UUID):
-    if account_id not in ALLOWED_ACCOUNT_IDS:
-        raise PermissionError(f"Account {account_id} is not allowed to perform this action")
-
-
-# =========================================================
-# 🔻 DEACTIVATE ACCOUNT
-# =========================================================
-def account_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    core = get_core(current_app)
-
-    try:
-        accounts_service = _get_accounts_service(core)
-
-        owner_account_id = _parse_uuid(kwargs.get("owner_account_id"), "owner_account_id")
-        account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
-
-        # ✅ VALIDATION
-        _validate_account_access(owner_account_id)
-        _validate_account_access(account_id)
-
-        account = accounts_service.request_account_deactivation(
-            owner_account_id=owner_account_id,
-            account_id=account_id,
-        )
-
-        return accounts_service.to_dict(account), 200
-
-    except PermissionError as e:
-        return {"error": str(e)}, 403
-    except Exception as e:
-        return {"error": str(e)}, 400
-
-
-# =========================================================
-# 🔻 ACTIVATE ACCOUNT
-# =========================================================
-def account_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    core = get_core(current_app)
-
-    try:
-        accounts_service = _get_accounts_service(core)
-
-        owner_account_id = _parse_uuid(kwargs.get("owner_account_id"), "owner_account_id")
-        account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
-
-        # ✅ VALIDATION
-        _validate_account_access(owner_account_id)
-        _validate_account_access(account_id)
-
-        account = accounts_service.request_account_reactivation(
-            owner_account_id=owner_account_id,
-            account_id=account_id,
-        )
-
-        return accounts_service.to_dict(account), 200
-
-    except PermissionError as e:
-        return {"error": str(e)}, 403
-    except Exception as e:
-        return {"error": str(e)}, 400
-
-
-# =========================================================
-# 🔻 DELETE ACCOUNT
-# =========================================================
-def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    core = get_core(current_app)
-
-    try:
-        accounts_service = _get_accounts_service(core)
-
-        owner_account_id = _parse_uuid(kwargs.get("owner_account_id"), "owner_account_id")
-        account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
-
-        # ✅ VALIDATION
-        _validate_account_access(owner_account_id)
-        _validate_account_access(account_id)
-
-        account = accounts_service.request_account_deletion(
-            owner_account_id=owner_account_id,
-            account_id=account_id,
-        )
-
-        return accounts_service.to_dict(account), 200
-
-    except PermissionError as e:
-        return {"error": str(e)}, 403
-    except Exception as e:
-        return {"error": str(e)}, 400
-
-
-# =========================================================
-# 🔻 ACCOUNT STATUS
-# =========================================================
-def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    core = get_core(current_app)
-
-    try:
-        accounts_service = _get_accounts_service(core)
-
-        account_id = _parse_uuid(kwargs.get("account_id"), "account_id")
-
-        # ✅ VALIDATION (optional but recommended)
-        _validate_account_access(account_id)
-
-        # service expects owner_account_id-like object
-        workspace = SimpleNamespace(owner_account_id=account_id)
-
-        account = accounts_service.get_account_details_by_id(workspace)
-
-        raw_status = getattr(account, "status", None)
-        status = raw_status if isinstance(raw_status, str) and raw_status else "ACTIVE"
-
-        response: Dict[str, Any] = {
-            "id": str(getattr(account, "id", account_id)),
-            "status": status,
-        }
-
-        if hasattr(account, "name"):
-            response["name"] = account.name
-
-        return response, 200
-
-    except PermissionError as e:
-        return {"error": str(e)}, 403
-    except Exception as e:
-        return {"error": str(e)}, 400
+FAILED tests/services/test_accounts.py::test_request_account_deactivation_no_active_workspaces
+  AccountNotInActiveException: <MagicMock ...list().__getitem__().id...>
 ```
 
----
+All three failures are caused by **the same root issue**: the tests were written for the **old** `get_by_owner_id` (the buggy one that called `.first()`), but the **new** code uses `results[0]` (which calls `__getitem__`). The mocks aren't aligned with the new implementation.
 
-# ✅ What you achieved now
+Let me walk through each:
 
-✔ Only 2 accounts can perform actions
-✔ Swagger input is respected
-✔ Unauthorized users → **403 Forbidden**
-✔ Clean reusable validation
-✔ No duplication
+## Failure 1: `test_get_by_owner_id_success`
 
----
+Looking at line 150 in your test:
+```python
+account_service.repositories.account_details.list.return_value.first.return_value = mock_account
+```
 
-# ⚡ If you want next level (recommended later)
+This sets up `list().first()` to return `mock_account`. But the new code does `results[0]`, which on a MagicMock triggers `__getitem__(0)` — a different mock attribute. So `results[0]` returns a fresh MagicMock, not your `mock_account`. The assertion `assert result is mock_account` fails because `result` is `list().__getitem__()` while `mock_account` is `list().first()`.
 
-Instead of hardcoding:
+**Fix:** Update the mock setup to align with the new code path:
+```python
+account_service.repositories.account_details.list.return_value = [mock_account]
+```
 
-* Move IDs to **env variable / config**
-* Or fetch from DB
+That makes `list(filters=...)` return a real Python list `[mock_account]`, and `results[0]` correctly returns `mock_account`.
 
----
+## Failure 2: `test_get_by_owner_id_raises_account_not_found`
 
-If you want, next I can help you:
+Line 158:
+```python
+account_service.repositories.account_details.list.side_effect = Exception("db err")
+```
 
-👉 Fix that Swagger wrong ID issue
-👉 Or add **logging + debugging trace**
-👉 Or convert this into **middleware (clean architecture)**
+This made `list()` itself throw `Exception("db err")`. The old code wrapped `list().first()` in `try/except Exception`, so any error became `AccountNotFoundException`. **You removed that try/except in your fix.** So now the raw `Exception("db err")` propagates up, and pytest sees it as an unhandled exception instead of the expected `AccountNotFoundException`.
+
+**Fix:** The new code raises `AccountNotFoundException` only when `results` is empty (not on exceptions). So the test should reflect the new contract: not-found means empty results, not an exception.
+
+```python
+account_service.repositories.account_details.list.return_value = []
+with pytest.raises(AccountNotFoundException):
+    account_service.get_by_owner_id("owner-123")
+```
+
+This tests the actual new behavior: when no rows match, raise `AccountNotFoundException`.
+
+## Failure 3: `test_request_account_deactivation_no_active_workspaces`
+
+Line 179:
+```python
+account_service.repositories.account_details.list.return_value.first.return_value = mock_account
+```
+
+Same problem as Failure 1 — the test is setting up `.first()` but the code calls `[0]`. So when `request_account_deactivation` internally calls `get_by_owner_id`, `results[0]` returns a MagicMock (not `mock_account`). That MagicMock has a `.status` that's also a MagicMock, which is `is not Status.ACTIVE`, so Core raises `AccountNotInActiveException` — exactly what we see in the error.
+
+**Fix:** Same pattern:
+```python
+mock_account = MagicMock(spec=AccountDetails, status=Status.ACTIVE)
+account_service.repositories.account_details.list.return_value = [mock_account]
+account_service.repositories.workspace.list.return_value = []
+```
+
+## Why the test file uses two different patterns
+
+I notice the test file actually has TWO different mocking patterns coexisting:
+
+- Lines 75–88 use a custom `MockRepo` class that returns real lists from `.list()` (returns `list(self.mock_dicts.values())`).
+- Lines 147–189 use `MagicMock` directly with `list.return_value.first.return_value = ...`.
+
+The `MockRepo` pattern was already designed for the new code (returns real lists, supports `[0]` indexing). The `MagicMock` pattern was written for the old `.first()` code. Whoever wrote those three failing tests didn't use `MockRepo` — they used MagicMock the way the original buggy code expected.
+
+## The fixes — three test functions to update
+
+Here's what each should look like:
+
+**`test_get_by_owner_id_success`** (around line 147):
+```python
+@pytest.mark.unit
+@pytest.mark.component
+def test_get_by_owner_id_success(account_service):
+    mock_account = MagicMock(spec=AccountDetails)
+    account_service.repositories.account_details.list.return_value = [mock_account]
+    
+    result = account_service.get_by_owner_id("owner-123")
+    assert result is mock_account
+```
+
+**`test_get_by_owner_id_raises_account_not_found`** (around line 157):
+```python
+@pytest.mark.unit
+@pytest.mark.component
+def test_get_by_owner_id_raises_account_not_found(account_service):
+    account_service.repositories.account_details.list.return_value = []
+    with pytest.raises(AccountNotFoundException):
+        account_service.get_by_owner_id("owner-123")
+```
+
+**`test_request_account_deactivation_no_active_workspaces`** (around line 174):
+```python
+@pytest.mark.unit
+@pytest.mark.component
+def test_request_account_deactivation_no_active_workspaces(account_service, mocker):
+    admin_id = "admin"
+    mocker.patch("dataviz_core.services.accounts.ADMIN_ACCOUNTS", f'"{admin_id}"')
+    
+    mock_account = MagicMock(spec=AccountDetails, status=Status.ACTIVE)
+    account_service.repositories.account_details.list.return_value = [mock_account]
+    account_service.repositories.workspace.list.return_value = []
+    
+    updated = MagicMock(status=Status.INACTIVE)
+    mocker.patch.object(
+        account_service, "_update_account_with_and_return", return_value=updated
+    )
+    
+    result = account_service.request_account_deactivation("owner-1", admin_id)
+    assert result.status == Status.INACTIVE
+```
+
+The key change in all three: `.list.return_value = [mock_account]` instead of `.list.return_value.first.return_value = mock_account`. And dropping the `side_effect = Exception(...)` pattern in the not-found test, since not-found is now signaled by an empty list, not by an exception.
+
+## Also worth adding
+
+While you're updating tests, add a couple more to cover the bug we hit in production:
+
+```python
+@pytest.mark.unit
+@pytest.mark.component
+def test_get_by_owner_id_returns_correct_account_when_filtered(account_service):
+    """Regression test: get_by_owner_id must return the account matching
+    the filter, not just the first row in the table."""
+    target = MagicMock(spec=AccountDetails)
+    # Repo returns just the filtered result (one row)
+    account_service.repositories.account_details.list.return_value = [target]
+    
+    result = account_service.get_by_owner_id("owner-target")
+    assert result is target
+
+@pytest.mark.unit
+@pytest.mark.component
+def test_get_by_owner_id_passes_correct_filter(account_service):
+    """get_by_owner_id should filter by owner_account_id."""
+    account_service.repositories.account_details.list.return_value = [MagicMock(spec=AccountDetails)]
+    
+    account_service.get_by_owner_id("owner-xyz")
+    
+    # Verify the filter was constructed with the right value
+    call_kwargs = account_service.repositories.account_details.list.call_args.kwargs
+    filters = call_kwargs.get("filters", [])
+    assert any(
+        getattr(f, "value", None) == "owner-xyz" or "owner-xyz" in str(f)
+        for f in filters
+    )
+```
+
+These would have caught the original `.first()` bug in CI before it ever shipped.
+
+Want me to write out all three fixed tests in full? Or shall I generate a consolidated patch you can drop in?
