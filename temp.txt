@@ -1,17 +1,19 @@
-def account_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    core = get_core(current_app)
-    try:
-        caller_account_id = _validate_allowed_account()
-        accounts_service = _get_accounts_service(core)
-        target_owner_account_id = _get_target_account_id(kwargs)
-        account = accounts_service.request_account_deactivation(
-            owner_account_id=target_owner_account_id,
-            account_id=caller_account_id,
-        )
-        return _account_to_response(account), 202
-    except ValueError as e:
-        return {"error": str(e)}, 400
-    except HTTPException:
-        raise
-    except Exception as e:
-        return _handle_core_exception(e)
+Implementation of account lifecycle resource management in Dataviz to automatically handle stopping and deletion of resources based on account status events.
+
+This change ensures that when an account is deactivated or deleted, all associated resources are properly handled to maintain system consistency and compliance.
+
+* Stop all active resources when a deactivation event is received via Event Bus
+* Delete all associated resources when a deletion event is received via Event Bus
+* Retain specific internal resources required for legal, forensic, or regulatory purposes
+* Introduce a garbage collection mechanism to periodically identify and clean up orphan/ghost resources
+
+⸻
+
+✅ CHRONOGRAM
+
+* Implementation (08:00 AM – 08:20 AM):
+    Deploy code changes to PRD to handle account deactivation and deletion events via Event Bus
+* Post-Implementation (08:20 AM – 08:30 AM):
+    Validate that resources are correctly stopped and deleted based on account lifecycle events
+* Rollback Plan:
+    In case of any failure, revert the deployed changes and restore previous behavior (no automated resource stop/deletion)
