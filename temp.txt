@@ -34,3 +34,9 @@ Technical Notes
 The DepedencyHealthBlock class remains for internal use but is no longer serialized into the response
 The comment field should dynamically describe the current health state (e.g., "All modules are healthy" or "dataviz:application module is degraded")
 Status enum values remain: UP, DEGRADED, DOWN
+
+----------------------------------------------------------------------------------------------------------------------------------------------
+
+Yesterday: "I went through the current health.py code and the new platform health standard doc. I created one internal doc also, mapping what we have now vs what the new standard is expecting. Basically I identified all the changes needed — like the response format, the data models, module naming, all that."
+Today: "Today I'm starting the actual implementation of the ticket OBSDATAVIZ-633. Main things are — updating the HealthResult and ModuleHealthBlock models to match the new standard, changing module names to the dataviz:module-name format, and updating the compute_health_result method to give the new response shape. Swagger schema also I'll update."
+Blockers: "No blockers as of now."
