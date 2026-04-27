@@ -1,0 +1,109 @@
+# =============================================================================
+# Swagger Schema Update for api_v1.yaml
+# =============================================================================
+# Add/replace these sections in dataviz-api/specifications/api_v1.yaml
+#
+# 1. Under `paths:`, update the /health endpoint
+# 2. Under `components: schemas:`, add Health and HealthModule schemas
+# =============================================================================
+
+# --- paths section ---
+
+paths:
+  /health:
+    get:
+      summary: Gets the health of the Dataviz Service
+      x-openapi-router-controller: dataviz_api.apis.v1.health_controller
+      operationId: health
+      responses:
+        "200":
+          description: Get the health status of the API
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+      tags:
+        - health
+
+# --- components/schemas section ---
+
+components:
+  schemas:
+    HealthModule:
+      type: object
+      required:
+        - name
+        - description
+        - status
+        - tags
+        - rootcause
+      description: Schema to describe the health of a given module
+      properties:
+        name:
+          description: "Name of the module with the format <app-name>:<module-name>"
+          example: "dataviz:application"
+          type: string
+        description:
+          description: "Description of the module"
+          example: "Core application module covering all Dataviz dependencies"
+          type: string
+        status:
+          example: "DOWN"
+          enum:
+            - DEGRADED
+            - DOWN
+            - UP
+          description: "Health status of the module"
+          type: string
+        tags:
+          description: "Optional tags"
+          type: array
+          items:
+            type: string
+            example: "tag1"
+        rootcause:
+          description: "Optional root cause when this module is down"
+          example: "PostgresClient is DOWN, DNSClient is DEGRADED"
+          type: string
+
+    Health:
+      type: object
+      required:
+        - description
+        - status
+        - time
+        - version
+        - modules
+        - comment
+      description: Schema to describe the health of the service
+      properties:
+        description:
+          type: string
+          example: "Health status of the Dataviz Service"
+          description: Description of the health status
+        status:
+          type: string
+          enum:
+            - DEGRADED
+            - DOWN
+            - UP
+          example: "UP"
+          description: Global status of the service
+        comment:
+          type: string
+          description: A comment on the current status of the service
+          example: "All modules are healthy"
+        time:
+          type: string
+          format: date-time
+          example: "1970-01-01 00:00:00.000000"
+          description: Timestamp when this health status was computed
+        version:
+          type: string
+          example: "1.0"
+          description: Version of the service
+        modules:
+          type: array
+          description: List of modules that acts on the global health status of the service
+          items:
+            $ref: "#/components/schemas/HealthModule"
