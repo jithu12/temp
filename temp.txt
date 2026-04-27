@@ -1,19 +1,36 @@
-Implementation of account lifecycle resource management in Dataviz to automatically handle stopping and deletion of resources based on account status events.
+Objective
+Migrate the Dataviz /health endpoint from the current custom implementation to the new Platform Health Standard as defined in the SGCP platform documentation.
+Context
+The current /health implementation in dataviz_core/services/health.py uses a custom response format with dependencies and modules arrays. The new standard requires a unified response format across all SGCP XaaS teams, with proper module naming (<app-name>:<module-name>), a description field, a time timestamp, a dynamically computed comment, and rootcause reporting for degraded/down modules.
+Reference documentation: https://documentation.cloud.socgen/internal/platform_standards/rest_api/health_next.html
+Scope of Changes
+Dataviz-Core (dataviz_core/services/health.py):
 
-This change ensures that when an account is deactivated or deleted, all associated resources are properly handled to maintain system consistency and compliance.
+Update HealthResult dataclass to match the new /health JSON schema (add description, time fields; remove top-level dependencies array)
+Update ModuleHealthBlock to include description, tags, and rootcause fields per the new HealthModule schema
+Rename module names to follow <app-name>:<module-name> format (e.g., dataviz:application)
+Update compute_health_result() to populate the new fields and compute a dynamic comment
+Update check_health() to return the new format
+Ensure v1_from_results() (or equivalent) builds the response per the new standard
+Keep the existing compute_status() sliding window logic unchanged
+Keep the existing Elasticsearch-based dependency health check logic unchanged
 
-* Stop all active resources when a deactivation event is received via Event Bus
-* Delete all associated resources when a deletion event is received via Event Bus
-* Retain specific internal resources required for legal, forensic, or regulatory purposes
-* Introduce a garbage collection mechanism to periodically identify and clean up orphan/ghost resources
+Dataviz-API (dataviz-api/specifications/api_v1.yaml):
 
-⸻
+Update the /health endpoint schema to reference the new Health and HealthModule component schemas
+Add HealthModule and Health schemas to components/schemas as per the platform standard
 
-✅ CHRONOGRAM
+Acceptance Criteria
 
-* Implementation (08:00 AM – 08:20 AM):
-    Deploy code changes to PRD to handle account deactivation and deletion events via Event Bus
-* Post-Implementation (08:20 AM – 08:30 AM):
-    Validate that resources are correctly stopped and deleted based on account lifecycle events
-* Rollback Plan:
-    In case of any failure, revert the deployed changes and restore previous behavior (no automated resource stop/deletion)
+GET /health returns a response matching the new Platform Health Standard JSON format
+Response includes: description, version, status, time, comment, and modules array
+Each module entry includes: name (in dataviz:<module> format), description, status, tags, rootcause
+Individual dependency checks are no longer exposed in the response (only module-level aggregation)
+Existing health computation logic (sliding window, Elasticsearch queries) remains unchanged
+Health results continue to be served from cache
+
+Technical Notes
+
+The DepedencyHealthBlock class remains for internal use but is no longer serialized into the response
+The comment field should dynamically describe the current health state (e.g., "All modules are healthy" or "dataviz:application module is degraded")
+Status enum values remain: UP, DEGRADED, DOWN
