@@ -1,42 +1,12 @@
-Objective
-Migrate the Dataviz /health endpoint from the current custom implementation to the new Platform Health Standard as defined in the SGCP platform documentation.
-Context
-The current /health implementation in dataviz_core/services/health.py uses a custom response format with dependencies and modules arrays. The new standard requires a unified response format across all SGCP XaaS teams, with proper module naming (<app-name>:<module-name>), a description field, a time timestamp, a dynamically computed comment, and rootcause reporting for degraded/down modules.
-Reference documentation: https://documentation.cloud.socgen/internal/platform_standards/rest_api/health_next.html
-Scope of Changes
-Dataviz-Core (dataviz_core/services/health.py):
-
-Update HealthResult dataclass to match the new /health JSON schema (add description, time fields; remove top-level dependencies array)
-Update ModuleHealthBlock to include description, tags, and rootcause fields per the new HealthModule schema
-Rename module names to follow <app-name>:<module-name> format (e.g., dataviz:application)
-Update compute_health_result() to populate the new fields and compute a dynamic comment
-Update check_health() to return the new format
-Ensure v1_from_results() (or equivalent) builds the response per the new standard
-Keep the existing compute_status() sliding window logic unchanged
-Keep the existing Elasticsearch-based dependency health check logic unchanged
-
-Dataviz-API (dataviz-api/specifications/api_v1.yaml):
-
-Update the /health endpoint schema to reference the new Health and HealthModule component schemas
-Add HealthModule and Health schemas to components/schemas as per the platform standard
-
-Acceptance Criteria
-
-GET /health returns a response matching the new Platform Health Standard JSON format
-Response includes: description, version, status, time, comment, and modules array
-Each module entry includes: name (in dataviz:<module> format), description, status, tags, rootcause
-Individual dependency checks are no longer exposed in the response (only module-level aggregation)
-Existing health computation logic (sliding window, Elasticsearch queries) remains unchanged
-Health results continue to be served from cache
-
-Technical Notes
-
-The DepedencyHealthBlock class remains for internal use but is no longer serialized into the response
-The comment field should dynamically describe the current health state (e.g., "All modules are healthy" or "dataviz:application module is degraded")
-Status enum values remain: UP, DEGRADED, DOWN
-
-----------------------------------------------------------------------------------------------------------------------------------------------
-
-Yesterday: "I went through the current health.py code and the new platform health standard doc. I created one internal doc also, mapping what we have now vs what the new standard is expecting. Basically I identified all the changes needed — like the response format, the data models, module naming, all that."
-Today: "Today I'm starting the actual implementation of the ticket OBSDATAVIZ-633. Main things are — updating the HealthResult and ModuleHealthBlock models to match the new standard, changing module names to the dataviz:module-name format, and updating the compute_health_result method to give the new response shape. Swagger schema also I'll update."
-Blockers: "No blockers as of now."
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    EXECUTE (
+        SELECT 'TRUNCATE TABLE ' ||
+               string_agg(quote_ident(tablename), ', ') ||
+               ' CASCADE;'
+        FROM pg_tables
+        WHERE schemaname = 'public'
+    );
+END $$;
