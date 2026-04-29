@@ -1,55 +1,61 @@
-The logs tell the full story. Look at this:
+This error is a **database migration issue** in the Async repo — nothing to do with your API code. The Celery worker is trying to store task results in a `celery_taskmeta` table but the sequence `task_id_sequence` doesn't exist in the DB.
+
+## What the error means
 
 ```
-INFO: No active workspaces found for owner_account_id: aaa11111-aaaa-aaaa-aaaa-aaaaaaaaaaaa
-INFO: AccountDetails (77777777-...) updating status from ACTIVE to INACTIVE
+psycopg2.errors.UndefinedTable: relation "task_id_sequence" does not exist
 ```
 
-**The deactivation IS working perfectly.** The account status changed from ACTIVE to INACTIVE. ✅
+Celery uses a DB table to track task results. The table exists (`celery_taskmeta`) but the sequence it depends on (`task_id_sequence`) was never created — meaning the DB migrations for the Async repo haven't been run.
 
-## Why workspaces aren't changing
+## This is NOT your problem to fix
 
-The log says **"No active workspaces found"** — which means the account `aaa11111-...` has **zero active workspaces** in the DB. So Core takes the direct path (no async job needed) and just flips the account status.
+This is an infrastructure/DB setup issue for the Async repo. Raise it to your Lead:
 
-This is correct behavior — if there are no active workspaces, there's nothing to deactivate in `api_workspaces`.
+> "When I start the Celery worker with `celery -A dataviz_async.app:app worker`, I get `UndefinedTable: relation 'task_id_sequence' does not exist`. Looks like the DB migrations for the Async repo haven't been applied on dev. What's the correct command to run the migrations?"
 
-## You're still using fake UUIDs
+## What they'll likely tell you
 
-Look at the two requests in the logs:
+Run the migrations for the Async repo. It's probably one of:
 
-**Request 1:**
-```
-target_account_id: bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb  ← fake
-```
+```bash
+# Option 1 — Alembic (most common in this codebase based on alembic.ini you saw earlier)
+cd Dataviz-Async
+alembic upgrade head
 
-**Request 2:**
-```
-owner_account_id: aaa11111-aaaa-aaaa-aaaa-aaaaaaaaaaaa  ← also fake
-```
+# Option 2 — Flask migrate
+flask db upgrade
 
-These are all fake test UUIDs. Of course they have no workspaces — they don't exist in the DB properly.
-
-## What you need to do — use a REAL UUID
-
-Run this SQL right now and get a real UUID that has workspaces:
-
-```sql
-SELECT 
-    a.owner_account_id,
-    a.name,
-    a.status,
-    COUNT(w.id) as workspace_count
-FROM public.api_account_details a
-LEFT JOIN public.api_workspaces w 
-    ON w.owner_account_id = a.owner_account_id
-GROUP BY a.owner_account_id, a.name, a.status
-HAVING COUNT(w.id) > 0;
+# Option 3 — Custom script
+python manage.py migrate
 ```
 
-Copy one of those real `owner_account_id` values and use it in Swagger. Then:
+Check the Async repo for an `alembic.ini` file:
+```bash
+ls Dataviz-Async/
+```
 
-1. Call `PATCH /admin/v1/accounts/{real_uuid}/deactivate`
-2. Check the logs — you should see the async job firing
-3. Check the DB — workspaces should show INACTIVE
+If `alembic.ini` is there, run:
+```bash
+cd Dataviz-Async
+alembic upgrade head
+```
 
-The code is working. You just need to test with real data.
+Then restart the Celery worker:
+```bash
+celery -A dataviz_async.app:app worker
+```
+
+## Summary of where everything stands
+
+| Item | Status |
+|---|---|
+| API admin gate | ✅ Working |
+| Path param passing | ✅ Working |
+| Core admin gate (`ADMIN_ACCOUNTS`) | ✅ Fixed |
+| `workflow_executor` injection | ✅ Fixed |
+| Accounts with 0 workspaces | ✅ Deactivate/activate/delete all work |
+| Accounts WITH workspaces | ⏳ Waiting for Celery worker DB migration |
+| Request body removed from YAML | ✅ Just fixed |
+
+Your code is done. The only remaining blocker is the Async repo DB migration which is an infrastructure issue. Once that's sorted and the Celery worker starts cleanly, the full cascade (account + all workspaces) will work end to end.
