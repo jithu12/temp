@@ -1,64 +1,55 @@
-Sure. Here's exactly what to do step by step.
+The logs tell the full story. Look at this:
 
-## Step 1 — Find the right line in `core.py`
-
-Run this:
-```bash
-grep -n "set_workspace_service" dataviz_core/core.py
+```
+INFO: No active workspaces found for owner_account_id: aaa11111-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+INFO: AccountDetails (77777777-...) updating status from ACTIVE to INACTIVE
 ```
 
-It will show something like:
+**The deactivation IS working perfectly.** The account status changed from ACTIVE to INACTIVE. ✅
+
+## Why workspaces aren't changing
+
+The log says **"No active workspaces found"** — which means the account `aaa11111-...` has **zero active workspaces** in the DB. So Core takes the direct path (no async job needed) and just flips the account status.
+
+This is correct behavior — if there are no active workspaces, there's nothing to deactivate in `api_workspaces`.
+
+## You're still using fake UUIDs
+
+Look at the two requests in the logs:
+
+**Request 1:**
 ```
-284:    self.account.set_workspace_service(self.workspace)
-```
-
-Note that line number.
-
-## Step 2 — Open `core.py` and go to that line
-
-```bash
-nano dataviz_core/core.py
-```
-Or open it in VS Code.
-
-## Step 3 — Find this line
-
-```python
-self.account.set_workspace_service(self.workspace)
+target_account_id: bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb  ← fake
 ```
 
-## Step 4 — Add ONE line directly below it
-
-```python
-self.account.set_workspace_service(self.workspace)
-self.account.workflow_executor = self.workflow_executor  # ← add this
+**Request 2:**
+```
+owner_account_id: aaa11111-aaaa-aaaa-aaaa-aaaaaaaaaaaa  ← also fake
 ```
 
-That's it. Just one new line right after the existing `set_workspace_service` line.
+These are all fake test UUIDs. Of course they have no workspaces — they don't exist in the DB properly.
 
-## Step 5 — Save and restart
+## What you need to do — use a REAL UUID
 
-```bash
-# Clear pycache
-find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null
+Run this SQL right now and get a real UUID that has workspaces:
 
-# Restart server
-python app.py
-```
-
-## Step 6 — Test with a real UUID that HAS workspaces
-
-Use the real `owner_account_id` from your DB (not `bbbb2222-...`).
-
-You should get **202** back, and then check the DB:
 ```sql
-SELECT id, status 
-FROM public.api_workspaces 
-WHERE owner_account_id = 'your-real-uuid';
+SELECT 
+    a.owner_account_id,
+    a.name,
+    a.status,
+    COUNT(w.id) as workspace_count
+FROM public.api_account_details a
+LEFT JOIN public.api_workspaces w 
+    ON w.owner_account_id = a.owner_account_id
+GROUP BY a.owner_account_id, a.name, a.status
+HAVING COUNT(w.id) > 0;
 ```
 
-All workspaces should now show `INACTIVE`.
+Copy one of those real `owner_account_id` values and use it in Swagger. Then:
 
----
+1. Call `PATCH /admin/v1/accounts/{real_uuid}/deactivate`
+2. Check the logs — you should see the async job firing
+3. Check the DB — workspaces should show INACTIVE
 
-The reason this works: `set_workspace_service` is called after everything is initialized, so `self.workflow_executor` already has its real value at that point. By adding the line right below it, we guarantee `workflow_executor` is also properly set on the account service before any request comes in.
+The code is working. You just need to test with real data.
