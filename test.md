@@ -1,134 +1,102 @@
-Sure. Let me find all the information I need first.
+Yes, you're right. Let me trace through exactly why the workspace status isn't changing.
 
-From everything we've seen across this conversation, here's what I know:
+## The flow when deactivate is called with workspaces
 
-**Fix 1** — `workspace.py` line 933: `request_stack_deletion(stack_id=...)` wrong param name.
-**Fix 2** — Response showing ACTIVE on async path — controller side fix.
-**Fix 3** — `service="accounts"` → `service="account"` already done.
+```
+API → request_account_deactivation → fires async job
+                                          ↓
+                              Celery picks up job
+                                          ↓
+                              deactivate_account(owner_account_id)
+                                          ↓
+                    workspace_service.deactivate_workspaces_by_owner_account_id()
+                                          ↓
+                              _deactivate_workspace(workspace)
+                                          ↓
+                    _kube_service.request_stack_deletion() ← THIS FAILS
+                                          ↓
+                              raises WorkspaceDeActivationFailedError
+                                          ↓
+                    workspace status set to "deactivation failed" NOT INACTIVE
+```
 
-Let me produce all fixes cleanly.
+## Look at `deactivate_workspaces_by_owner_account_id` in workspace.py
 
-## Fix 1 — `dataviz_core/services/workspace.py`
+From the screenshots earlier (lines 890-912):
 
-Find line 933 area:
+```python
+try:
+    workspace_res = self._deactivate_workspace(workspace)
+    _workspace_updates["status"] = "deactivated"
+except WorkspaceDeActivationFailedError as e:
+    _workspace_updates["status"] = "deactivation failed"  # ← sets failed, not INACTIVE
+    self.logger.error(...)
+    continue
+```
+
+And `_deactivate_workspace`:
+```python
+try:
+    self._kube_service.request_stack_deletion(
+        stack_id=workspace.kube_stack_id,  # ← this was failing
+    )
+except Exception as e:
+    self._update_workspace_with(workspace, status=Status.FAILED)
+    raise WorkspaceDeActivationFailedError(workspace.id) from e
+
+return self._update_workspace_with_and_return(workspace, status=Status.INACTIVE)
+```
+
+So the workspace only gets set to `INACTIVE` if `_kube_service.request_stack_deletion` **succeeds**. If it fails (which it was, due to the wrong param name), the workspace gets set to `FAILED` and the status never reaches `INACTIVE`.
+
+## What to check now
+
+You said you fixed the `request_stack_deletion` param bug. After that fix, the flow should work. But let me ask:
+
+**Did you restart BOTH the API server AND the Celery worker after fixing the param?**
+
 ```bash
-grep -n "request_stack_deletion" dataviz_core/services/workspace.py
+# Terminal 1 - restart API
+python app.py
+
+# Terminal 2 - restart Celery worker
+celery -A dataviz_async.app:app worker
 ```
 
-It currently says:
-```python
-self._kube_service.request_stack_deletion(
-    stack_id=workspace.kube_stack_id,
-)
+Both need to restart to pick up the Core code change.
+
+## Also check — what does the Celery log say NOW after the param fix?
+
+Run deactivate again on a real UUID with workspaces and share the Celery worker terminal output. It should now show either:
+
+**Success:**
+```
+INFO: Starting Workspace (xxx) deactivation
+INFO: Deactivation completed for owner_account_id: xxx
 ```
 
-Check the correct param name:
-```bash
-grep -n "def request_stack_deletion" dataviz_core/adapters/kube_client.py
+**Or a different error** — which means there's another issue in the kube call chain.
+
+## Also — in dev, does kube actually work?
+
+This is important. `_deactivate_workspace` calls `_kube_service.request_stack_deletion` which actually tries to **delete a Kubernetes stack**. In a dev environment, this might fail because:
+
+1. No Kubernetes cluster is connected
+2. The stack doesn't actually exist in kube
+3. Dev kube credentials aren't configured
+
+If that's the case, every workspace deactivation will fail at the kube level — not because of your code, but because the infrastructure isn't there in dev.
+
+Check the Celery logs after the restart. If you see something like:
+
+```
+ConnectionRefusedError: [Errno 111] Connection refused
+# or
+kubernetes.client.exceptions.ApiException
+# or
+KubeError: stack not found
 ```
 
-Based on the pattern I saw in `_activate_workspace` earlier (which used `ws_name`, `name`, `dns_id`, `database_id`, `kube_namespace_id`), the deletion probably just needs the stack id directly. Change to:
+Then it's a kube infrastructure issue in dev, not a code issue.
 
-```python
-self._kube_service.request_stack_deletion(
-    workspace.kube_stack_id,  # positional, no keyword
-)
-```
-
-Or if it has a different keyword name, whatever `def request_stack_deletion` shows. Share the output of that grep and I'll confirm.
-
-## Fix 2 — `dataviz_core/services/accounts.py`
-
-The response shows ACTIVE because Core returns the account object **before** the async job runs. Fix this by returning the account with updated status immediately after firing the async job.
-
-In `request_account_deactivation`, change:
-
-```python
-self.workflow_executor.async_exec_core_function(
-    service="account",
-    function="deactivate_account",
-    kwargs={"owner_account_id": owner_account_id},
-)
-
-return account  # ← returns stale ACTIVE status
-```
-
-To:
-
-```python
-self.workflow_executor.async_exec_core_function(
-    service="account",
-    function="deactivate_account",
-    kwargs={"owner_account_id": owner_account_id},
-)
-
-# Return account with updated status so response reflects
-# what was requested, not the stale pre-async status
-return self._update_account_with_and_return(
-    account, status=Status.INACTIVE
-)
-```
-
-Same fix for `request_account_reactivation`:
-```python
-# Change:
-return account
-
-# To:
-return self._update_account_with_and_return(
-    account, status=Status.ACTIVE
-)
-```
-
-And `request_account_deletion`:
-```python
-# Change:
-return account
-
-# To:
-return self._update_account_with_and_return(
-    account, status=Status.DELETED
-)
-```
-
-## Fix 3 — `accounts_controller.py` (already in your file)
-
-No change needed here — the controller correctly returns `_account_to_response(account)` which will now show the updated status since Fix 2 updates it before returning.
-
-## Fix 4 — Confirm `service="account"` change
-
-In `dataviz_core/services/accounts.py`, confirm all three places say `service="account"` (singular):
-
-```python
-# request_account_deactivation
-self.workflow_executor.async_exec_core_function(
-    service="account",           # ← singular
-    function="deactivate_account",
-    kwargs={"owner_account_id": owner_account_id},
-)
-
-# request_account_reactivation
-self.workflow_executor.async_exec_core_function(
-    service="account",           # ← singular
-    function="reactivate_account",
-    kwargs={"owner_account_id": owner_account_id},
-)
-
-# request_account_deletion
-self.workflow_executor.async_exec_core_function(
-    service="account",           # ← singular
-    function="delete_account",
-    kwargs={"owner_account_id": owner_account_id},
-)
-```
-
-## One thing I need from you before confirming Fix 1
-
-Run this and share the output:
-```bash
-grep -n "def request_stack_deletion" dataviz_core/adapters/kube_client.py
-# or if that doesn't find it:
-grep -rn "def request_stack_deletion" dataviz_core/
-```
-
-That'll show me the exact method signature so I can give you the precise parameter name for Fix 1. Everything else above is ready to apply.
+**Share the Celery worker logs after restarting both processes and trying deactivate again.** That'll tell us definitively what's happening at the workspace level.
