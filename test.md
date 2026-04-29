@@ -1,89 +1,134 @@
-Great progress! Two separate issues here. Let me address them one by one.
+Sure. Let me find all the information I need first.
 
-## Issue 1 — `request_stack_deletion() got unexpected keyword argument 'stack_id'`
+From everything we've seen across this conversation, here's what I know:
 
-This is in Core's `workspace.py` line 933:
-```python
-self._kube_service.request_stack_deletion(
-    stack_id=workspace.kube_stack_id,  # ← wrong parameter name
-)
-```
+**Fix 1** — `workspace.py` line 933: `request_stack_deletion(stack_id=...)` wrong param name.
+**Fix 2** — Response showing ACTIVE on async path — controller side fix.
+**Fix 3** — `service="accounts"` → `service="account"` already done.
 
-The `_kube_service.request_stack_deletion` method doesn't accept `stack_id` as a keyword argument. Check what parameter name it expects:
+Let me produce all fixes cleanly.
 
+## Fix 1 — `dataviz_core/services/workspace.py`
+
+Find line 933 area:
 ```bash
-grep -n "def request_stack_deletion" dataviz_core/adapters/
-# or
-grep -rn "def request_stack_deletion" dataviz_core/
+grep -n "request_stack_deletion" dataviz_core/services/workspace.py
 ```
 
-It probably expects something like `kube_stack_id` or just a positional argument. Once you find the right name, fix line 933 in `workspace.py`.
-
-**This is your Lead's code** — raise it:
-> "`_deactivate_workspace` calls `self._kube_service.request_stack_deletion(stack_id=...)` but `request_stack_deletion` doesn't accept `stack_id` as a keyword argument. What's the correct parameter name?"
-
-## Issue 2 — Response shows ACTIVE even after deactivation succeeds
-
-This is the expected behavior I mentioned earlier. Look at Core:
-
+It currently says:
 ```python
-def request_account_deactivation(self, owner_account_id, account_id):
-    ...
-    # Has workspaces → fires async job
-    self.workflow_executor.async_exec_core_function(...)
-
-    return account  # ← returns account AS-IS before async job completes
-```
-
-When workspaces exist, Core fires the async job and **immediately returns the account object** — which still has `status=ACTIVE` because the async job hasn't run yet. The actual status change to INACTIVE happens in the background after the async job completes.
-
-This is correct async behavior — the response tells you "request accepted" (202), not "already done." The status in the response reflects the state **at the time of the request**.
-
-To fix the response to be less confusing, update `_account_to_response` in your controller to return a more descriptive status when the account has workspaces — OR simply accept that 202 means "in progress."
-
-Actually the simplest fix is in Core — instead of returning `account` (which has old status), return a version that indicates the request is in progress. But that's a Core change.
-
-For now the cleanest API-side fix is to **not return the account status at all** when the async path is taken, and instead return a clear message:
-
-```python
-return {
-    "id": str(getattr(account, "id", "")),
-    "owner_account_id": str(getattr(account, "owner_account_id", "")),
-    "status": "DEACTIVATION_REQUESTED",  # ← descriptive
-    "name": getattr(account, "name", None),
-}, 202
-```
-
-But wait — looking at this more carefully, Core's `request_account_deactivation` always returns `account` on the async path. Your `_account_to_response` just serializes whatever Core returns. The fix should be in how you interpret the 202 response.
-
-## Summary of what's actually working vs broken
-
-| Item | Status |
-|---|---|
-| `api_account_details` status updating | ✅ Working |
-| Response status showing ACTIVE on async path | ⚠️ Expected — async hasn't completed yet |
-| `api_workspace` status updating | ❌ Blocked by `request_stack_deletion` param bug |
-
-## What to do right now
-
-**Step 1 — Find the correct parameter name:**
-```bash
-grep -rn "def request_stack_deletion" dataviz_core/
-```
-
-**Step 2 — Fix the call in `workspace.py` line 933:**
-```python
-# Change from:
 self._kube_service.request_stack_deletion(
     stack_id=workspace.kube_stack_id,
 )
+```
 
-# To whatever the correct param name is, e.g.:
+Check the correct param name:
+```bash
+grep -n "def request_stack_deletion" dataviz_core/adapters/kube_client.py
+```
+
+Based on the pattern I saw in `_activate_workspace` earlier (which used `ws_name`, `name`, `dns_id`, `database_id`, `kube_namespace_id`), the deletion probably just needs the stack id directly. Change to:
+
+```python
 self._kube_service.request_stack_deletion(
-    kube_stack_id=workspace.kube_stack_id,
+    workspace.kube_stack_id,  # positional, no keyword
 )
 ```
 
-**Step 3 — Raise the response-status issue to your Lead** — since it's Core returning the stale status on the async path, not your API code.
+Or if it has a different keyword name, whatever `def request_stack_deletion` shows. Share the output of that grep and I'll confirm.
 
-Share what `grep -rn "def request_stack_deletion"` returns and I'll tell you the exact fix.
+## Fix 2 — `dataviz_core/services/accounts.py`
+
+The response shows ACTIVE because Core returns the account object **before** the async job runs. Fix this by returning the account with updated status immediately after firing the async job.
+
+In `request_account_deactivation`, change:
+
+```python
+self.workflow_executor.async_exec_core_function(
+    service="account",
+    function="deactivate_account",
+    kwargs={"owner_account_id": owner_account_id},
+)
+
+return account  # ← returns stale ACTIVE status
+```
+
+To:
+
+```python
+self.workflow_executor.async_exec_core_function(
+    service="account",
+    function="deactivate_account",
+    kwargs={"owner_account_id": owner_account_id},
+)
+
+# Return account with updated status so response reflects
+# what was requested, not the stale pre-async status
+return self._update_account_with_and_return(
+    account, status=Status.INACTIVE
+)
+```
+
+Same fix for `request_account_reactivation`:
+```python
+# Change:
+return account
+
+# To:
+return self._update_account_with_and_return(
+    account, status=Status.ACTIVE
+)
+```
+
+And `request_account_deletion`:
+```python
+# Change:
+return account
+
+# To:
+return self._update_account_with_and_return(
+    account, status=Status.DELETED
+)
+```
+
+## Fix 3 — `accounts_controller.py` (already in your file)
+
+No change needed here — the controller correctly returns `_account_to_response(account)` which will now show the updated status since Fix 2 updates it before returning.
+
+## Fix 4 — Confirm `service="account"` change
+
+In `dataviz_core/services/accounts.py`, confirm all three places say `service="account"` (singular):
+
+```python
+# request_account_deactivation
+self.workflow_executor.async_exec_core_function(
+    service="account",           # ← singular
+    function="deactivate_account",
+    kwargs={"owner_account_id": owner_account_id},
+)
+
+# request_account_reactivation
+self.workflow_executor.async_exec_core_function(
+    service="account",           # ← singular
+    function="reactivate_account",
+    kwargs={"owner_account_id": owner_account_id},
+)
+
+# request_account_deletion
+self.workflow_executor.async_exec_core_function(
+    service="account",           # ← singular
+    function="delete_account",
+    kwargs={"owner_account_id": owner_account_id},
+)
+```
+
+## One thing I need from you before confirming Fix 1
+
+Run this and share the output:
+```bash
+grep -n "def request_stack_deletion" dataviz_core/adapters/kube_client.py
+# or if that doesn't find it:
+grep -rn "def request_stack_deletion" dataviz_core/
+```
+
+That'll show me the exact method signature so I can give you the precise parameter name for Fix 1. Everything else above is ready to apply.
