@@ -1,61 +1,89 @@
-This error is a **database migration issue** in the Async repo — nothing to do with your API code. The Celery worker is trying to store task results in a `celery_taskmeta` table but the sequence `task_id_sequence` doesn't exist in the DB.
+Great progress! Two separate issues here. Let me address them one by one.
 
-## What the error means
+## Issue 1 — `request_stack_deletion() got unexpected keyword argument 'stack_id'`
 
+This is in Core's `workspace.py` line 933:
+```python
+self._kube_service.request_stack_deletion(
+    stack_id=workspace.kube_stack_id,  # ← wrong parameter name
+)
 ```
-psycopg2.errors.UndefinedTable: relation "task_id_sequence" does not exist
-```
 
-Celery uses a DB table to track task results. The table exists (`celery_taskmeta`) but the sequence it depends on (`task_id_sequence`) was never created — meaning the DB migrations for the Async repo haven't been run.
-
-## This is NOT your problem to fix
-
-This is an infrastructure/DB setup issue for the Async repo. Raise it to your Lead:
-
-> "When I start the Celery worker with `celery -A dataviz_async.app:app worker`, I get `UndefinedTable: relation 'task_id_sequence' does not exist`. Looks like the DB migrations for the Async repo haven't been applied on dev. What's the correct command to run the migrations?"
-
-## What they'll likely tell you
-
-Run the migrations for the Async repo. It's probably one of:
+The `_kube_service.request_stack_deletion` method doesn't accept `stack_id` as a keyword argument. Check what parameter name it expects:
 
 ```bash
-# Option 1 — Alembic (most common in this codebase based on alembic.ini you saw earlier)
-cd Dataviz-Async
-alembic upgrade head
-
-# Option 2 — Flask migrate
-flask db upgrade
-
-# Option 3 — Custom script
-python manage.py migrate
+grep -n "def request_stack_deletion" dataviz_core/adapters/
+# or
+grep -rn "def request_stack_deletion" dataviz_core/
 ```
 
-Check the Async repo for an `alembic.ini` file:
-```bash
-ls Dataviz-Async/
+It probably expects something like `kube_stack_id` or just a positional argument. Once you find the right name, fix line 933 in `workspace.py`.
+
+**This is your Lead's code** — raise it:
+> "`_deactivate_workspace` calls `self._kube_service.request_stack_deletion(stack_id=...)` but `request_stack_deletion` doesn't accept `stack_id` as a keyword argument. What's the correct parameter name?"
+
+## Issue 2 — Response shows ACTIVE even after deactivation succeeds
+
+This is the expected behavior I mentioned earlier. Look at Core:
+
+```python
+def request_account_deactivation(self, owner_account_id, account_id):
+    ...
+    # Has workspaces → fires async job
+    self.workflow_executor.async_exec_core_function(...)
+
+    return account  # ← returns account AS-IS before async job completes
 ```
 
-If `alembic.ini` is there, run:
-```bash
-cd Dataviz-Async
-alembic upgrade head
+When workspaces exist, Core fires the async job and **immediately returns the account object** — which still has `status=ACTIVE` because the async job hasn't run yet. The actual status change to INACTIVE happens in the background after the async job completes.
+
+This is correct async behavior — the response tells you "request accepted" (202), not "already done." The status in the response reflects the state **at the time of the request**.
+
+To fix the response to be less confusing, update `_account_to_response` in your controller to return a more descriptive status when the account has workspaces — OR simply accept that 202 means "in progress."
+
+Actually the simplest fix is in Core — instead of returning `account` (which has old status), return a version that indicates the request is in progress. But that's a Core change.
+
+For now the cleanest API-side fix is to **not return the account status at all** when the async path is taken, and instead return a clear message:
+
+```python
+return {
+    "id": str(getattr(account, "id", "")),
+    "owner_account_id": str(getattr(account, "owner_account_id", "")),
+    "status": "DEACTIVATION_REQUESTED",  # ← descriptive
+    "name": getattr(account, "name", None),
+}, 202
 ```
 
-Then restart the Celery worker:
-```bash
-celery -A dataviz_async.app:app worker
-```
+But wait — looking at this more carefully, Core's `request_account_deactivation` always returns `account` on the async path. Your `_account_to_response` just serializes whatever Core returns. The fix should be in how you interpret the 202 response.
 
-## Summary of where everything stands
+## Summary of what's actually working vs broken
 
 | Item | Status |
 |---|---|
-| API admin gate | ✅ Working |
-| Path param passing | ✅ Working |
-| Core admin gate (`ADMIN_ACCOUNTS`) | ✅ Fixed |
-| `workflow_executor` injection | ✅ Fixed |
-| Accounts with 0 workspaces | ✅ Deactivate/activate/delete all work |
-| Accounts WITH workspaces | ⏳ Waiting for Celery worker DB migration |
-| Request body removed from YAML | ✅ Just fixed |
+| `api_account_details` status updating | ✅ Working |
+| Response status showing ACTIVE on async path | ⚠️ Expected — async hasn't completed yet |
+| `api_workspace` status updating | ❌ Blocked by `request_stack_deletion` param bug |
 
-Your code is done. The only remaining blocker is the Async repo DB migration which is an infrastructure issue. Once that's sorted and the Celery worker starts cleanly, the full cascade (account + all workspaces) will work end to end.
+## What to do right now
+
+**Step 1 — Find the correct parameter name:**
+```bash
+grep -rn "def request_stack_deletion" dataviz_core/
+```
+
+**Step 2 — Fix the call in `workspace.py` line 933:**
+```python
+# Change from:
+self._kube_service.request_stack_deletion(
+    stack_id=workspace.kube_stack_id,
+)
+
+# To whatever the correct param name is, e.g.:
+self._kube_service.request_stack_deletion(
+    kube_stack_id=workspace.kube_stack_id,
+)
+```
+
+**Step 3 — Raise the response-status issue to your Lead** — since it's Core returning the stale status on the async path, not your API code.
+
+Share what `grep -rn "def request_stack_deletion"` returns and I'll tell you the exact fix.
