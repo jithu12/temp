@@ -1,3 +1,4 @@
+import os
 from typing import Tuple, Dict, Any
 from uuid import UUID
 
@@ -9,14 +10,30 @@ from platform_api.permissions import get_current_account_id
 
 
 # --------------------------------------------------------------------------
-# Admin allowlist
+# Admin accounts configuration
 # --------------------------------------------------------------------------
-# Only these two accounts are permitted to invoke the mutating admin
-# endpoints (deactivate / activate / delete).
+# These two UUIDs are the only accounts allowed to perform admin operations.
+# _ADMIN_ACCOUNT_1 and _ADMIN_ACCOUNT_2 are defined once and reused for:
+#   - ALLOWED_ACCOUNT_IDS: API-level gate checked before any Core call.
+#   - ADMIN_ACCOUNTS env var: Core reads this to validate the caller.
+# Both must contain the same UUIDs so the two gates agree.
+
+_ADMIN_ACCOUNT_1 = "3c24a85d-f148-485e-96a9-c21d47b42f54"
+_ADMIN_ACCOUNT_2 = "d3ac47ac-cc43-4da7-b935-d0c0b1d4c7b9"
+
+# Set ADMIN_ACCOUNTS env var for Core if not already set externally.
+# This ensures Core's admin gate passes without a manual terminal export.
+os.environ.setdefault(
+    "ADMIN_ACCOUNTS",
+    f'["{_ADMIN_ACCOUNT_1}","{_ADMIN_ACCOUNT_2}"]',
+)
+
+# API-level admin gate.
 ALLOWED_ACCOUNT_IDS = {
-    UUID("d3ac47ac-cc43-4da7-b935-d0c0b1d4c7b9"),
-    UUID("3c24a85d-f148-485e-96a9-c21d47b42f54"),
+    UUID(_ADMIN_ACCOUNT_1),
+    UUID(_ADMIN_ACCOUNT_2),
 }
+
 
 
 # --------------------------------------------------------------------------
