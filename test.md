@@ -1,104 +1,64 @@
-Simple — two changes in Core.
+Sure. Here's exactly what to do step by step.
 
-## Change 1 — `dataviz_core/services/accounts.py`
+## Step 1 — Find the right line in `core.py`
 
-Add `workflow_executor` to `__init__`:
-
-```python
-# Add this import at the top if not already there
-from dataviz_core.adapters.celery_workflow_executor import WorkflowExecutor
-
-class AccountService(SessionManagerMixin):
-    def __init__(
-        self,
-        account_client: AccountClient,
-        session_provider: SessionProvider,
-        repository_context: Optional[RepositoryContext] = None,
-        is_retrying_func: Callable[[], bool] = lambda: False,
-        logger: Optional[LoggerType] = None,
-        workflow_executor: WorkflowExecutor = None,  # ← ADD THIS LINE
-    ) -> None:
-        super().__init__(
-            session_provider,
-            repository_context=repository_context,
-        )
-        self.is_retrying_func = is_retrying_func
-        self.account_client = account_client
-        self.logger = logger if logger else get_default_logger(__name__)
-        self.workspace_service = None
-        self.workflow_executor = workflow_executor  # ← ADD THIS LINE
-```
-
-## Change 2 — `dataviz_core/core.py`
-
-Find where `AccountService` is instantiated. It will look something like this:
-
-```python
-self.account = AccountService(
-    account_client=...,
-    session_provider=...,
-    repository_context=...,
-)
-```
-
-Add `workflow_executor`:
-
-```python
-self.account = AccountService(
-    account_client=...,
-    session_provider=...,
-    repository_context=...,
-    workflow_executor=self.workflow_executor,  # ← ADD THIS LINE
-)
-```
-
-## How to find the exact spot in `core.py`
-
-Run:
+Run this:
 ```bash
-grep -n "AccountService(" dataviz_core/core.py
+grep -n "set_workspace_service" dataviz_core/core.py
 ```
 
-That'll give you the line number. Open that line and just add `workflow_executor=self.workflow_executor,` to the constructor call.
-
-## How to verify the import path for `WorkflowExecutor`
-
-From your grep output earlier I saw:
+It will show something like:
 ```
-dataviz_core/core.py:3: from dataviz_core.adapters.celery_workflow_executor import (
-dataviz_core/core.py:4:     celery_workflow_executor_from_config,
+284:    self.account.set_workspace_service(self.workspace)
 ```
 
-So the import in `accounts.py` should be:
+Note that line number.
+
+## Step 2 — Open `core.py` and go to that line
+
+```bash
+nano dataviz_core/core.py
+```
+Or open it in VS Code.
+
+## Step 3 — Find this line
+
 ```python
-from dataviz_core.adapters.celery_workflow_executor import WorkflowExecutor
+self.account.set_workspace_service(self.workspace)
 ```
 
-But to be safe, run:
-```bash
-grep -n "class WorkflowExecutor\|WorkflowExecutor" dataviz_core/adapters/celery_workflow_executor.py | head -5
+## Step 4 — Add ONE line directly below it
+
+```python
+self.account.set_workspace_service(self.workspace)
+self.account.workflow_executor = self.workflow_executor  # ← add this
 ```
 
-That confirms the exact class name and import path.
+That's it. Just one new line right after the existing `set_workspace_service` line.
 
-## After making both changes
+## Step 5 — Save and restart
 
-1. Clear pycache:
 ```bash
+# Clear pycache
 find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null
+
+# Restart server
+python app.py
 ```
 
-2. Restart server.
+## Step 6 — Test with a real UUID that HAS workspaces
 
-3. Test with a **real `owner_account_id`** that HAS active workspaces.
+Use the real `owner_account_id` from your DB (not `bbbb2222-...`).
 
-4. Check the DB after the call:
+You should get **202** back, and then check the DB:
 ```sql
-SELECT id, status, owner_account_id 
+SELECT id, status 
 FROM public.api_workspaces 
-WHERE owner_account_id = 'your-real-uuid-here';
+WHERE owner_account_id = 'your-real-uuid';
 ```
 
-All workspaces should show `INACTIVE`. And the account in `api_account_details` should also show `INACTIVE`.
+All workspaces should now show `INACTIVE`.
 
-That's the complete fix. Two lines in Core and the full cascade works end to end.
+---
+
+The reason this works: `set_workspace_service` is called after everything is initialized, so `self.workflow_executor` already has its real value at that point. By adding the line right below it, we guarantee `workflow_executor` is also properly set on the account service before any request comes in.
