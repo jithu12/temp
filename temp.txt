@@ -1,3 +1,7 @@
-grep -rn "workflow_executor" dataviz_core/ | grep -v __pycache__
-
-grep -rn "workflow_executor" dataviz_api/ | grep -v __pycache__
+SELECT a.owner_account_id, a.name, a.status,
+       COUNT(w.id) as workspace_count
+FROM public.api_account_details a
+LEFT JOIN public.api_workspaces w 
+    ON w.owner_account_id = a.owner_account_id
+    AND w.status = 'ACTIVE'
+GROUP BY a.owner_account_id, a.name, a.status;
