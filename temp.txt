@@ -1,3 +1,11 @@
-The workspace status isn't changing after account deactivation/reactivation. Found two issues:
-Issue 1 — Deactivation: _deactivate_workspace calls _kube_service.request_stack_deletion which fails in dev because there's no real Kubernetes cluster. When it fails, the workspace is set to FAILED instead of INACTIVE. Do we have a mock/dev kube service to use? Or should the kube call be optional in dev?
-Issue 2 — Reactivation: reactivate_workspace has inverted logic. The check if workspace.status is not Status.ACTIVE catches INACTIVE workspaces and raises WorkspaceActivationFailedError immediately. The activation logic below it is never reached. It should be if workspace.status is Status.ACTIVE: raise error — reject already-active workspaces, not inactive ones.
+Primary Skill: Developers (Data Visualization)
+
+Secondary Skill: Patching/Support
+
+Skills:
+- Grafana Dashboard Development & Monitoring
+- Data Visualization & Metrics Analysis
+- SQL & Data Querying
+- Alerting & Monitoring Setup
+- Basic Scripting (Python/Shell)
+- Production Support & Incident Handling
