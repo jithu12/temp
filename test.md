@@ -1,102 +1,100 @@
-Yes, you're right. Let me trace through exactly why the workspace status isn't changing.
+Got it bro 👍 — this is a classic CAB rejection feedback. They’re basically saying:
 
-## The flow when deactivate is called with workspaces
+👉 “Your change is missing proper justification + structured description + checklist items”
 
-```
-API → request_account_deactivation → fires async job
-                                          ↓
-                              Celery picks up job
-                                          ↓
-                              deactivate_account(owner_account_id)
-                                          ↓
-                    workspace_service.deactivate_workspaces_by_owner_account_id()
-                                          ↓
-                              _deactivate_workspace(workspace)
-                                          ↓
-                    _kube_service.request_stack_deletion() ← THIS FAILS
-                                          ↓
-                              raises WorkspaceDeActivationFailedError
-                                          ↓
-                    workspace status set to "deactivation failed" NOT INACTIVE
-```
+No worries — I’ll give you a ready-to-paste corrected version that will pass review ✅
 
-## Look at `deactivate_workspaces_by_owner_account_id` in workspace.py
+⸻
 
-From the screenshots earlier (lines 890-912):
+✅ UPDATED CHANGE CONTENT (Use this)
 
-```python
-try:
-    workspace_res = self._deactivate_workspace(workspace)
-    _workspace_updates["status"] = "deactivated"
-except WorkspaceDeActivationFailedError as e:
-    _workspace_updates["status"] = "deactivation failed"  # ← sets failed, not INACTIVE
-    self.logger.error(...)
-    continue
-```
+📝 Description (Mandatory Format)
 
-And `_deactivate_workspace`:
-```python
-try:
-    self._kube_service.request_stack_deletion(
-        stack_id=workspace.kube_stack_id,  # ← this was failing
-    )
-except Exception as e:
-    self._update_workspace_with(workspace, status=Status.FAILED)
-    raise WorkspaceDeActivationFailedError(workspace.id) from e
+[CONTEXT]:
+Upgrade of RabbitMQ broker version for CCP application (daz-prd) to comply with latest security hardening requirements communicated by CCP team.
+[DESCRIPTION]:
+Current RabbitMQ broker version is outdated and does not meet security standards. This change involves upgrading the broker using CCP API to ensure compliance and avoid forced upgrade by CCP team.
+[RISK TO DO]:
+Medium – Temporary service downtime during upgrade. Potential message loss if control plane is not stopped before upgrade.
+[RISK OF NOT DOING]:
+High – Non-compliance with security standards may lead to enforced upgrade by CCP team, potential service disruption, and security vulnerabilities.
+[WORST CASE SCENARIO]:
+Upgrade failure leading to application downtime or message processing issues.
+[RAMP UP]:
+N/A
+[COMMUNICATION PLAN]:
+YES – Communication will be sent before starting the activity and after completion of the upgrade.
+[SERVERS / COMPONENTS]:
+RabbitMQ broker associated with CCP application "daz-prd" (Region: Paris)
 
-return self._update_workspace_with_and_return(workspace, status=Status.INACTIVE)
-```
+⸻
 
-So the workspace only gets set to `INACTIVE` if `_kube_service.request_stack_deletion` **succeeds**. If it fails (which it was, due to the wrong param name), the workspace gets set to `FAILED` and the status never reaches `INACTIVE`.
+📌 Justification (THIS WAS MISSING ⚠️)
 
-## What to check now
+This change is required to address security vulnerabilities identified in the current RabbitMQ broker version.
+As per CCP team communication, the broker version does not comply with security hardening standards. Upgrade is mandatory to ensure system security, compliance, and avoid enforced actions from CCP team.
 
-You said you fixed the `request_stack_deletion` param bug. After that fix, the flow should work. But let me ask:
+⸻
 
-**Did you restart BOTH the API server AND the Celery worker after fixing the param?**
+✅ Checklist / Good to have section
 
-```bash
-# Terminal 1 - restart API
-python app.py
+[OTHER USEFUL INFORMATIONS]: N/A
+[FUNCTIONAL TESTING]: NO (Infrastructure change)
+[ROLLBACK]: YES – Downgrade or CCP-supported rollback
+[IMPACT ANALYSIS]: YES – Planned downtime during upgrade
+[4 EYES REVIEW]: YES
+[CHRONOGRAM]: Defined in change
+[HOSTNAME]:
+- CCP Managed Broker (No direct host access)
+[ROLLOUT PROCEDURES including Pre-checks & Post-checks]: YES
+[TYPE]: STANDARD
+[ENVIRONMENT]: PRD
 
-# Terminal 2 - restart Celery worker
-celery -A dataviz_async.app:app worker
-```
+⸻
 
-Both need to restart to pick up the Core code change.
+🔍 Pre-checks (Add this properly)
 
-## Also check — what does the Celery log say NOW after the param fix?
+- Verify current broker status and application connectivity
+- Confirm no active critical processing jobs
+- Notify stakeholders about downtime
+- Ensure CCP API access and permissions
 
-Run deactivate again on a real UUID with workspaces and share the Celery worker terminal output. It should now show either:
+⸻
 
-**Success:**
-```
-INFO: Starting Workspace (xxx) deactivation
-INFO: Deactivation completed for owner_account_id: xxx
-```
+🔍 Post-checks
 
-**Or a different error** — which means there's another issue in the kube call chain.
+- Validate RabbitMQ broker health
+- Test message publishing and consumption
+- Verify application connectivity
+- Check logs for errors
+- Confirm service stability
 
-## Also — in dev, does kube actually work?
+⸻
 
-This is important. `_deactivate_workspace` calls `_kube_service.request_stack_deletion` which actually tries to **delete a Kubernetes stack**. In a dev environment, this might fail because:
+🔥 Why your change got flagged (simple)
 
-1. No Kubernetes cluster is connected
-2. The stack doesn't actually exist in kube
-3. Dev kube credentials aren't configured
+* ❌ Justification missing
+* ❌ Description not in required format
+* ❌ Checklist incomplete
+* ❌ Chronogram missing
 
-If that's the case, every workspace deactivation will fail at the kube level — not because of your code, but because the infrastructure isn't there in dev.
+⸻
 
-Check the Celery logs after the restart. If you see something like:
+💬 What you can reply to mail (optional)
 
-```
-ConnectionRefusedError: [Errno 111] Connection refused
-# or
-kubernetes.client.exceptions.ApiException
-# or
-KubeError: stack not found
-```
+If they expect response:
 
-Then it's a kube infrastructure issue in dev, not a code issue.
+Hi,
+Thank you for the review.
+I have updated the change with required justification, structured description, rollout checks, and checklist items as suggested.
+Please review and approve.
+Thanks,
+Jithu
 
-**Share the Celery worker logs after restarting both processes and trying deactivate again.** That'll tell us definitively what's happening at the workspace level.
+⸻
+
+If you want, I can:
+👉 Review your final filled form before submission
+👉 Or make it exactly matching your company template (SG standard)
+
+Just send 👍
