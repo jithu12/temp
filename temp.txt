@@ -1,392 +1,110 @@
-import os
-from typing import Tuple, Dict, Any
-from uuid import UUID
-
-from werkzeug.exceptions import HTTPException
-from flask import current_app, abort
-
-from dataviz_api.core import get_core
-from platform_api.permissions import get_current_account_id
-
-
-# --------------------------------------------------------------------------
-# Admin accounts configuration
-# --------------------------------------------------------------------------
-_ADMIN_ACCOUNT_1 = "3c24a85d-f148-485e-96a9-c21d47b42f54"
-_ADMIN_ACCOUNT_2 = "d3ac47ac-cc43-4da7-b935-d0c0b1d4c7b9"
-
-os.environ.setdefault(
-    "ADMIN_ACCOUNTS",
-    f'["{_ADMIN_ACCOUNT_1}","{_ADMIN_ACCOUNT_2}"]',
-)
-
-ALLOWED_ACCOUNT_IDS = {
-    UUID(_ADMIN_ACCOUNT_1),
-    UUID(_ADMIN_ACCOUNT_2),
-}
-
-
-# --------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------
-def _get_accounts_service(core: Any) -> Any:
-    """Return the account service from core regardless of singular/plural naming."""
-    service = getattr(core, "accounts", None) or getattr(core, "account", None)
-    if service is None:
-        raise RuntimeError("Account service is not available in core")
-    return service
-
-
-def _validate_allowed_account() -> UUID:
-    """
-    Block the request unless the logged-in account is one of the two
-    hardcoded admin accounts. Returns the caller's UUID on success.
-    """
-    caller_account_id = get_current_account_id()
-    try:
-        caller_uuid = UUID(str(caller_account_id))
-    except (ValueError, TypeError):
-        abort(403, description="You are not authorized to perform this action")
-
-    if caller_uuid not in ALLOWED_ACCOUNT_IDS:
-        abort(403, description="You are not authorized to perform this action")
-
-    return caller_uuid
-
-
-def _parse_uuid(value: Any, field_name: str) -> UUID:
-    """Helper to parse UUIDs with a clear error message."""
-    try:
-        return UUID(str(value))
-    except Exception:
-        raise ValueError(
-            f"Invalid UUID provided for '{field_name}'. "
-            f"Expected format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+def _delete_workspace(self, workspace: Workspace, is_failed: bool = False) -> Workspace:
+    if not is_failed:
+        self.logger.info(f"Deleting {logname(workspace)}...")
+        workspace = self._update_workspace_with_and_return(
+            workspace,
+            status=Status.DELETING
         )
 
-
-def _get_target_account_id(kwargs: Dict[str, Any]) -> UUID:
-    """
-    Extract the target account id from the path parameter.
-    Named 'target_account_id' to avoid collision with the caller
-    'account_id' injected by the auth middleware into kwargs.
-    """
-    raw = kwargs.get("target_account_id")
-    if raw is None:
-        raise ValueError(
-            "Missing required path parameter 'target_account_id'. "
-            "Please provide the owner_account_id of the account to act on."
-        )
-    return _parse_uuid(raw, "target_account_id")
-
-
-def _get_caller_account_id(kwargs: Dict[str, Any]) -> UUID:
-    """
-    Extract the caller's account_id from the OAuth token (injected by
-    auth middleware). Core checks this against ADMIN_ACCOUNTS env var.
-    """
-    raw = kwargs.get("account_id")
-    if raw is None:
-        raise ValueError("Missing caller account_id from token")
-    return _parse_uuid(raw, "account_id")
-
-
-def _get_account_status(account: Any) -> str:
-    """Extract the status string from an AccountDetails object."""
-    raw_status = getattr(account, "status", None)
-    if raw_status is None:
-        return "UNKNOWN"
-    if hasattr(raw_status, "value"):
-        return str(raw_status.value)
-    return str(raw_status)
-
-
-def _account_to_response(account: Any) -> Dict[str, Any]:
-    """
-    Build the API response dict from an AccountDetails object.
-    Status is a Status enum so we serialize its .value as a string.
-    """
-    response: Dict[str, Any] = {
-        "id": str(getattr(account, "id", "")),
-        "status": _get_account_status(account),
-    }
-    owner = getattr(account, "owner_account_id", None)
-    if owner is not None:
-        response["owner_account_id"] = str(owner)
-    name = getattr(account, "name", None)
-    if name:
-        response["name"] = name
-    return response
-
-
-def _check_account_exists(accounts_service: Any, owner_account_id: UUID) -> Any:
-    """
-    Fetch the account and return it. Raises a clear error if not found.
-    Used for pre-checks before calling Core lifecycle methods.
-    """
     try:
-        return accounts_service.get_by_owner_id(str(owner_account_id))
+        self.sg_connect_service.remove_redirect_url(
+            workspace.sg_connect,
+            workspace.dns.fqdn
+        )
+
+        self._dataplane.request_component_deletion(
+            component_id=workspace.dataplane_component.id
+        )
+
+        self._dataplane.vault.delete_secret(
+            secret_id=workspace.dataplane_component.vault_secret_id
+        )
+
+        # TODO: Remove this once all workspace certificate migration completed
+        if workspace.dns.certificate:
+            self._dataplane.vault.delete_secret(
+                secret_id=workspace.dns.certificate.vault_secret_id
+            )
+
+        if workspace.kube_stack.vault_secret_id:
+            self._dataplane.vault.delete_secret(
+                secret_id=workspace.kube_stack.vault_secret_id
+            )
+        else:
+            self.logger.warning(
+                "No vault_secret_id found for kube stack. Skipping secret deletion."
+            )
+
+        self._dns.request_dns_deletion(dns_id=workspace.dns_id)
+
+        self._kube_service.request_namespace_deletion(
+            namespace_id=workspace.kube_stack.kube_namespace.id,
+            stack_id=workspace.kube_stack.id,
+        )
+
     except Exception as e:
-        if type(e).__name__ == "AccountNotFoundException":
-            raise
-        raise
-
-
-def _handle_core_exception(e: Exception) -> Tuple[Dict[str, Any], int]:
-    """
-    Map Core exceptions to HTTP status codes with clear error messages.
-    Matched by class name so Core exceptions don't need to be imported.
-    """
-    name = type(e).__name__
-
-    if name == "NotOwnerError":
-        return {
-            "error": "You are not authorized to perform admin operations.",
-            "code": "ADMIN_ACCESS_REQUIRED",
-        }, 403
-
-    if name == "AccountNotFoundException":
-        return {
-            "error": "Account not found. Please check the owner_account_id and try again.",
-            "code": "ACCOUNT_NOT_FOUND",
-        }, 404
-
-    if name == "AccountNotInActiveException":
-        return {
-            "error": "Account is not in the required state for this operation.",
-            "code": "ACCOUNT_INVALID_STATE",
-        }, 409
-
-    return {
-        "error": f"An unexpected error occurred: {str(e)}",
-        "code": "INTERNAL_ERROR",
-    }, 500
-
-
-# --------------------------------------------------------------------------
-# Pre-flight status checks
-# --------------------------------------------------------------------------
-def _assert_account_is_active(account: Any, owner_account_id: UUID) -> None:
-    """
-    Raise a clear 409 if the account is not ACTIVE.
-    Used before deactivation and deletion.
-    """
-    status = _get_account_status(account)
-
-    if status == "INACTIVE":
-        raise ValueError(
-            f"ACCOUNT_ALREADY_INACTIVE:"
-            f"Account '{owner_account_id}' is already inactive. "
-            f"No changes were made."
-        )
-    if status == "DELETED":
-        raise ValueError(
-            f"ACCOUNT_ALREADY_DELETED:"
-            f"Account '{owner_account_id}' has already been deleted. "
-            f"No changes were made."
-        )
-    if status != "ACTIVE":
-        raise ValueError(
-            f"ACCOUNT_INVALID_STATE:"
-            f"Account '{owner_account_id}' is in state '{status}' "
-            f"and cannot be deactivated. Only ACTIVE accounts can be deactivated."
+        self.logger.exception(
+            f"{logname(workspace)}: '{workspace.name}' deletion failed. "
+            f"Marking workspace DELETED regardless. Error: {e}"
         )
 
+    return self._update_workspace_with_and_return(
+        workspace,
+        status=Status.DELETED
+    )
 
-def _assert_account_is_inactive(account: Any, owner_account_id: UUID) -> None:
-    """
-    Raise a clear 409 if the account is not INACTIVE.
-    Used before reactivation.
-    """
-    status = _get_account_status(account)
+def delete_workspaces_by_owner_account_id(
+    self,
+    owner_account_id: uuid.UUID
+) -> List[Dict]:
 
-    if status == "ACTIVE":
-        raise ValueError(
-            f"ACCOUNT_ALREADY_ACTIVE:"
-            f"Account '{owner_account_id}' is already active. "
-            f"No changes were made."
-        )
-    if status == "DELETED":
-        raise ValueError(
-            f"ACCOUNT_ALREADY_DELETED:"
-            f"Account '{owner_account_id}' has been deleted and cannot be reactivated. "
-            f"No changes were made."
-        )
-    if status != "INACTIVE":
-        raise ValueError(
-            f"ACCOUNT_INVALID_STATE:"
-            f"Account '{owner_account_id}' is in state '{status}' "
-            f"and cannot be reactivated. Only INACTIVE accounts can be reactivated."
-        )
+    workspace_updates = []
 
+    # Fetch ALL workspaces for this owner regardless of status
+    # so INACTIVE and FAILED workspaces are also deleted
+    filters = [
+        FilteringCriterion("owner_account_id", owner_account_id),
+    ]
 
-def _handle_state_error(e: ValueError) -> Tuple[Dict[str, Any], int]:
-    """
-    Parse the structured ValueError messages from the pre-flight checks
-    and return a clean JSON response with the right HTTP status code.
-    """
-    message = str(e)
+    workspaces = self.repositories.workspace.list(filters=filters)
 
-    code_map = {
-        "ACCOUNT_ALREADY_INACTIVE": ("Account is already inactive. No changes were made.", 409),
-        "ACCOUNT_ALREADY_ACTIVE": ("Account is already active. No changes were made.", 409),
-        "ACCOUNT_ALREADY_DELETED": ("Account has been deleted and cannot be modified.", 409),
-        "ACCOUNT_INVALID_STATE": ("Account is not in the required state for this operation.", 409),
-    }
+    for workspace in workspaces:
+        _workspace_updates = {}
+        self.logger.info(f"Starting {logname(workspace)} deletion")
 
-    for prefix, (friendly_message, status_code) in code_map.items():
-        if message.startswith(f"{prefix}:"):
-            detail = message.split(":", 1)[1].strip()
-            return {
-                "error": friendly_message,
-                "detail": detail,
-                "code": prefix,
-            }, status_code
+        if workspace.status is Status.DELETED:
+            self.logger.info(f"{logname(workspace)} already deleted — skipping")
+            _workspace_updates["workspace_id"] = str(workspace.id)
+            _workspace_updates["status"] = "already deleted"
+            _workspace_updates["name"] = workspace.name
+            workspace_updates.append(_workspace_updates)
+            continue
 
-    # Generic ValueError (e.g. bad UUID format)
-    return {"error": message, "code": "VALIDATION_ERROR"}, 400
+        if workspace.status in [
+            Status.ACTIVE,
+            Status.INACTIVE,
+            Status.FAILED,
+        ]:
+            try:
+                workspace_res = self.delete_workspace(workspace.id)
+                _workspace_updates["workspace_id"] = str(workspace_res.id)
+                _workspace_updates["status"] = "deleted"
+                _workspace_updates["name"] = workspace_res.name
+                workspace_updates.append(_workspace_updates)
 
+            except WorkspaceDeletionFailedError as e:
+                # Even if deletion failed, force status to DELETED
+                self.logger.error(
+                    f"Deletion failed for {logname(workspace)}. "
+                    f"Forcing DELETED status. Error: {e}"
+                )
+                self._update_workspace_with(workspace, status=Status.DELETED)
+                _workspace_updates["workspace_id"] = str(workspace.id)
+                _workspace_updates["status"] = "deleted"
+                _workspace_updates["name"] = workspace.name
+                workspace_updates.append(_workspace_updates)
+                continue
 
-# --------------------------------------------------------------------------
-# Admin lifecycle endpoints
-# --------------------------------------------------------------------------
-def account_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """
-    PATCH /admin/v1/accounts/{target_account_id}/deactivate
-
-    Deactivates the target account and all its workspaces.
-
-    Pre-checks:
-    - Caller must be in ALLOWED_ACCOUNT_IDS
-    - Account must exist
-    - Account must be ACTIVE (not already INACTIVE or DELETED)
-    """
-    core = get_core(current_app)
-
-    try:
-        _validate_allowed_account()
-
-        accounts_service = _get_accounts_service(core)
-        target_owner_account_id = _get_target_account_id(kwargs)
-        caller_account_id = _get_caller_account_id(kwargs)
-
-        # Pre-flight check — give a clear message before hitting Core
-        account = _check_account_exists(accounts_service, target_owner_account_id)
-        _assert_account_is_active(account, target_owner_account_id)
-
-        account = accounts_service.request_account_deactivation(
-            owner_account_id=target_owner_account_id,
-            account_id=caller_account_id,
-        )
-
-        return _account_to_response(account), 202
-
-    except ValueError as e:
-        return _handle_state_error(e)
-    except HTTPException:
-        raise
-    except Exception as e:
-        return _handle_core_exception(e)
-
-
-def account_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """
-    PATCH /admin/v1/accounts/{target_account_id}/activate
-
-    Reactivates the target account and all its workspaces.
-
-    Pre-checks:
-    - Caller must be in ALLOWED_ACCOUNT_IDS
-    - Account must exist
-    - Account must be INACTIVE (not already ACTIVE or DELETED)
-    """
-    core = get_core(current_app)
-
-    try:
-        _validate_allowed_account()
-
-        accounts_service = _get_accounts_service(core)
-        target_owner_account_id = _get_target_account_id(kwargs)
-        caller_account_id = _get_caller_account_id(kwargs)
-
-        # Pre-flight check — give a clear message before hitting Core
-        account = _check_account_exists(accounts_service, target_owner_account_id)
-        _assert_account_is_inactive(account, target_owner_account_id)
-
-        account = accounts_service.request_account_reactivation(
-            owner_account_id=target_owner_account_id,
-            account_id=caller_account_id,
-        )
-
-        return _account_to_response(account), 202
-
-    except ValueError as e:
-        return _handle_state_error(e)
-    except HTTPException:
-        raise
-    except Exception as e:
-        return _handle_core_exception(e)
-
-
-def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """
-    DELETE /admin/v1/accounts/{target_account_id}
-
-    Deletes the target account and all its associated workspaces.
-
-    Pre-checks:
-    - Caller must be in ALLOWED_ACCOUNT_IDS
-    - Account must exist
-    - Account must be ACTIVE (Core requires ACTIVE for deletion)
-    """
-    core = get_core(current_app)
-
-    try:
-        _validate_allowed_account()
-
-        accounts_service = _get_accounts_service(core)
-        target_owner_account_id = _get_target_account_id(kwargs)
-        caller_account_id = _get_caller_account_id(kwargs)
-
-        # Pre-flight check — give a clear message before hitting Core
-        account = _check_account_exists(accounts_service, target_owner_account_id)
-        _assert_account_is_active(account, target_owner_account_id)
-
-        account = accounts_service.request_account_deletion(
-            owner_account_id=target_owner_account_id,
-            account_id=caller_account_id,
-        )
-
-        return _account_to_response(account), 202
-
-    except ValueError as e:
-        return _handle_state_error(e)
-    except HTTPException:
-        raise
-    except Exception as e:
-        return _handle_core_exception(e)
-
-
-def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """
-    GET /admin/v1/accounts/{target_account_id}/status
-
-    Returns the current lifecycle status of the specified account.
-    Available to any authenticated user (no admin gate).
-    """
-    core = get_core(current_app)
-
-    try:
-        accounts_service = _get_accounts_service(core)
-        target_account_id = _get_target_account_id(kwargs)
-
-        account = accounts_service.get_by_owner_id(str(target_account_id))
-
-        return _account_to_response(account), 200
-
-    except ValueError as e:
-        return _handle_state_error(e)
-    except HTTPException:
-        raise
-    except Exception as e:
-        return _handle_core_exception(e)
+    return workspace_updates
+```
