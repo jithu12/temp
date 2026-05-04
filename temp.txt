@@ -59,3 +59,49 @@ def _delete_workspace(self, workspace: Workspace, is_failed: bool = False) -> Wo
         workspace,
         status=Status.DELETED
     )
+
+
+def delete_workspace(
+    self,
+    workspace_id: uuid.UUID,
+    is_failed: bool = False
+) -> Workspace:
+
+    workspace = self.repositories.workspace.get_by_id(workspace_id)
+    workspace = self._refresh_workspace(workspace.id)
+
+    self.logger.info(f"Starting {logname(workspace)} deletion")
+
+    if workspace.status is Status.CREATING:
+        self.logger.error(f"Cannot delete {logname(workspace)} while it's creating")
+        raise WorkspaceDeletionFailedError(workspace.id)
+
+    if workspace.status in [
+        Status.ACTIVE,
+        Status.INACTIVE,               # ← ADD THIS
+        Status.DELETION_REQUESTED,
+        Status.CREATION_REQUESTED,
+    ]:
+        return self._delete_workspace(workspace)
+
+    if workspace.status is Status.DELETING:
+        self.logger.error(f"{logname(workspace)} deletion already started")
+        return self._poll_deletion(workspace)
+
+    if workspace.status is Status.DELETED:
+        self.logger.error(f"{logname(workspace)} already deleted")
+        return workspace
+
+    if workspace.status in [Status.FAILED, Status.RETRYING]:
+        if is_failed:
+            return self._delete_workspace(workspace, is_failed=is_failed)
+        # ← also handle FAILED without is_failed flag
+        self.logger.warning(
+            f"Deleting {logname(workspace)} from FAILED state"
+        )
+        return self._delete_workspace(workspace)
+
+    self.logger.error(
+        f"Unknown status for {logname(workspace)}: '{workspace.status}'"
+    )
+    raise WorkspaceDeletionFailedError(workspace.id)
