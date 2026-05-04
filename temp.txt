@@ -108,3 +108,60 @@ def delete_workspaces_by_owner_account_id(
 
     return workspace_updates
 ```
+
+def _delete_workspace(self, workspace: Workspace, is_failed: bool = False) -> Workspace:
+    if not is_failed:
+        self.logger.info(f"Deleting {logname(workspace)}...")
+        workspace = self._update_workspace_with_and_return(
+            workspace,
+            status=Status.DELETING
+        )
+
+    try:
+        self.sg_connect_service.remove_redirect_url(
+            workspace.sg_connect,
+            workspace.dns.fqdn
+        )
+
+        self._dataplane.request_component_deletion(
+            component_id=workspace.dataplane_component.id
+        )
+
+        self._dataplane.vault.delete_secret(
+            secret_id=workspace.dataplane_component.vault_secret_id
+        )
+
+        # TODO: Remove this once all workspace certificate migration completed
+        if workspace.dns.certificate:
+            self._dataplane.vault.delete_secret(
+                secret_id=workspace.dns.certificate.vault_secret_id
+            )
+
+        if workspace.kube_stack.vault_secret_id:
+            self._dataplane.vault.delete_secret(
+                secret_id=workspace.kube_stack.vault_secret_id
+            )
+        else:
+            self.logger.warning(
+                "No vault_secret_id found for kube stack. Skipping secret deletion."
+            )
+
+        self._dns.request_dns_deletion(dns_id=workspace.dns_id)
+
+        self._kube_service.request_namespace_deletion(
+            namespace_id=workspace.kube_stack.kube_namespace.id,
+            stack_id=workspace.kube_stack.id,
+        )
+
+    except Exception as e:
+        self.logger.exception(
+            f"{logname(workspace)}: '{workspace.name}' deletion failed. "
+            f"Marking workspace DELETED regardless. Error: {e}"
+        )
+
+    return self._update_workspace_with_and_return(
+        workspace,
+        status=Status.DELETED
+    )
+
+
