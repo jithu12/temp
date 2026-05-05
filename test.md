@@ -1,67 +1,198 @@
-OK let's trace this systematically. When you call **activate**, it should only change workspace status to `ACTIVE` — nothing should go to `DELETED`. The fact that one workspace goes `DELETED` during activation means something in the activate flow is accidentally calling delete logic.
+Yes absolutely. Let me think back carefully to what the code looked like **before** we touched any delete functions.
 
-## Step 1 — Find the exact workspace going DELETED
+## What we changed in `workspace.py`
 
-Before you call activate, note all workspace statuses:
-```sql
-SELECT id, name, status 
-FROM public.api_workspace
-WHERE owner_account_id = 'your-real-uuid'
-ORDER BY name;
-```
+We modified three functions:
+1. `_delete_workspace`
+2. `delete_workspaces_by_owner_account_id`
+3. `delete_workspace`
 
-Save that output. Then call activate. Then run the same query again. Tell me:
-- Which workspace changed to DELETED?
-- What was its status BEFORE activate was called?
+Here are the **original versions** before any of our changes:
 
-## Step 2 — Check the Celery logs carefully
-
-When you call activate, the Celery worker log should show what's happening to each workspace. Share the full Celery output after calling activate. Look for lines mentioning the workspace that ended up DELETED.
-
-## My strongest suspicion
-
-Look at `reactivate_workspaces_by_owner_account_id` — it filters for `Status.INACTIVE` workspaces:
+## `_delete_workspace` — original
 
 ```python
-filters = [
-    FilteringCriterion("owner_account_id", account_activation_id),
-    FilteringCriterion("status", Status.INACTIVE),
-]
+def _delete_workspace(self, workspace: Workspace, is_failed: bool = False) -> Workspace:
+    if not is_failed:
+        self.logger.info(f"Deleting {logname(workspace)}...")
+        workspace = self._update_workspace_with_and_return(
+            workspace,
+            status=Status.DELETING
+        )
+
+    try:
+        self.sg_connect_service.remove_redirect_url(
+            workspace.sg_connect,
+            workspace.dns.fqdn
+        )
+
+        self._dataplane.request_component_deletion(
+            component_id=workspace.dataplane_component.id
+        )
+
+        self._dataplane.vault.delete_secret(
+            secret_id=workspace.dataplane_component.vault_secret_id
+        )
+
+        # TODO: Remove this once all workspace certificate migration completed
+        if workspace.dns.certificate:
+            self._dataplane.vault.delete_secret(
+                secret_id=workspace.dns.certificate.vault_secret_id
+            )
+
+        if workspace.kube_stack.vault_secret_id:
+            self._dataplane.vault.delete_secret(
+                secret_id=workspace.kube_stack.vault_secret_id
+            )
+        else:
+            self.logger.warning(
+                "No vault_secret_id found for kube stack. Skipping secret deletion."
+            )
+
+        self._dns.request_dns_deletion(dns_id=workspace.dns_id)
+
+        self._kube_service.request_namespace_deletion(
+            namespace_id=workspace.kube_stack.kube_namespace.id,
+            stack_id=workspace.kube_stack.id,
+        )
+
+        if not is_failed:
+            workspace = self._update_workspace_with_and_return(
+                workspace,
+                status=Status.DELETED,
+            )
+
+    except Exception as e:
+        self.logger.exception(
+            f"{logname(workspace)}: '{workspace.name}' deletion failed"
+        )
+        self._update_workspace_with(workspace, status=Status.FAILED)
+        raise WorkspaceDeletionFailedError(workspace.id) from e
+
+    return self._update_workspace_with_and_return(
+        workspace,
+        status=Status.DELETED
+    )
 ```
 
-Then calls `reactivate_workspace(workspace.id)`. And look at `reactivate_workspace`:
+## `delete_workspace` — original
 
 ```python
-def reactivate_workspace(self, workspace_id):
+def delete_workspace(
+    self,
+    workspace_id: uuid.UUID,
+    is_failed: bool = False
+) -> Workspace:
+
     workspace = self.repositories.workspace.get_by_id(workspace_id)
-    workspace = self._refresh_workspace(workspace.id)  # ← refreshes from external source
+    workspace = self._refresh_workspace(workspace.id)
 
-    if workspace.status is Status.ACTIVE:
-        raise WorkspaceActivationFailedError(workspace.id)
+    self.logger.info(f"Starting {logname(workspace)} deletion")
 
-    if workspace.status is Status.INACTIVE:
-        return self._activate_workspace(workspace)
+    if workspace.status is Status.CREATING:
+        self.logger.error(f"Cannot delete {logname(workspace)} while it's creating")
+        raise WorkspaceDeletionFailedError(workspace.id)
 
-    self.logger.error(f"Unknown status for {logname(workspace)}: {workspace.status}")
-    raise WorkspaceActivationFailedError(workspace.id)
+    if workspace.status in [
+        Status.ACTIVE,
+        Status.DELETION_REQUESTED,
+        Status.CREATION_REQUESTED,
+    ]:
+        return self._delete_workspace(workspace)
+
+    if workspace.status is Status.DELETING:
+        self.logger.error(f"{logname(workspace)} deletion already started")
+        return self._poll_deletion(workspace)
+
+    if workspace.status is Status.DELETED:
+        self.logger.error(f"{logname(workspace)} already deleted")
+        return workspace
+
+    if workspace.status in [Status.FAILED, Status.RETRYING]:
+        if is_failed:
+            return self._delete_workspace(workspace, is_failed=is_failed)
+
+        self.logger.error(
+            f"Cannot delete {logname(workspace)} while it is in {workspace.status} status"
+        )
+        raise WorkspaceDeletionFailedError(workspace.id)
+
+    self.logger.error(
+        f"Unknown status for {logname(workspace)}: '{workspace.status}'"
+    )
+    raise WorkspaceDeletionFailedError(workspace.id)
 ```
 
-The suspicious line is `self._refresh_workspace(workspace.id)`. This refreshes the workspace state from an external source (probably Kubernetes). If the workspace exists in your DB as `INACTIVE` but Kubernetes reports it as something else (like `DELETED` or not found), `_refresh_workspace` might update the status to something unexpected.
+## `delete_workspaces_by_owner_account_id` — original
 
-Check what `_refresh_workspace` does:
+```python
+def delete_workspaces_by_owner_account_id(
+    self,
+    owner_account_id: uuid.UUID
+) -> List[Dict]:
+
+    workspace_updates = []
+
+    filters = [
+        FilteringCriterion("owner_account_id", owner_account_id),
+        FilteringCriterion("status", Status.ACTIVE),
+    ]
+
+    workspaces = self.repositories.workspace.list(filters=filters)
+
+    for workspace in workspaces:
+        _workspace_updates = {}
+        self.logger.info(f"Starting {logname(workspace)} deletion")
+
+        if workspace.status is Status.DELETED:
+            self.logger.error(f"{logname(workspace)} already deleted")
+            _workspace_updates["workspace_id"] = str(workspace.id)
+            _workspace_updates["status"] = "account status already in deleted state"
+            _workspace_updates["name"] = workspace.name
+            workspace_updates.append(_workspace_updates)
+            continue
+
+        if workspace.status in [
+            Status.ACTIVE,
+            Status.INACTIVE,
+        ]:
+            try:
+                workspace_res = self.delete_workspace(workspace.id)
+                _workspace_updates["workspace_id"] = str(workspace_res.id)
+                _workspace_updates["status"] = "deleted"
+                _workspace_updates["name"] = workspace_res.name
+                workspace_updates.append(_workspace_updates)
+
+            except WorkspaceDeletionFailedError as e:
+                _workspace_updates["workspace_id"] = str(workspace.id)
+                _workspace_updates["status"] = "deletion failed"
+                _workspace_updates["name"] = workspace.name
+                workspace_updates.append(_workspace_updates)
+                self.logger.error(
+                    f"Deletion failed for {logname(workspace)}. Error: {e}"
+                )
+                continue
+
+    return workspace_updates
+```
+
+## Put all three back into `workspace.py`
+
+Replace your current versions with these exact originals. Then:
+
 ```bash
-grep -n -A 20 "def _refresh_workspace" dataviz_core/services/workspace.py
+# Clear pycache
+find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null
+
+# Restart both
+python app.py
+celery -A dataviz_async.app:app worker
 ```
 
-Share the output — I think that's where the bug is.
+## Then test activate only
 
-## Also check — is the DELETED workspace the one that was FAILED before?
+Before touching delete again, test just activate and deactivate with a real UUID. Check if the "workspace going DELETED during activate" issue still happens with the original code. If it does, the bug is **not** in the delete functions we changed — it's somewhere else (likely `_refresh_workspace` as I suspected).
 
-Remember one workspace was `FAILED` from the previous deactivation attempts. When activate runs, it filters for `INACTIVE` — so `FAILED` workspaces shouldn't be touched. But if `_refresh_workspace` changes a `FAILED` workspace to something else, it could get caught in unexpected logic.
+Once you confirm activate/deactivate work cleanly with the original code, we can approach delete more carefully — one small change at a time, testing after each change.
 
-Share:
-1. SQL output before and after activate (which workspace changed to DELETED)
-2. Full Celery log during activate
-3. Output of `grep -n -A 20 "def _refresh_workspace" dataviz_core/services/workspace.py`
-
-That'll pinpoint exactly where the DELETED status is being set during activation.
+Share the Celery log and the SQL before/after activate once you've reverted. That'll tell us exactly where the DELETED status is coming from.
