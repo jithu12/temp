@@ -1,2 +1,150 @@
-sed -n '490,505p' dataviz_core/services/workspace.py
-sed -n '58,75p' dataviz_core/utils/__init__.py
+@pytest.mark.parametrize(
+    ["input_app", "calls"],
+    [
+        # index 0 — CREATION_REQUESTED -> goes through DELETING -> DELETED
+        [
+            [
+                workspace_model(
+                    id="workspace_id",
+                    status=Status.CREATION_REQUESTED,
+                    status_history=[Status.CREATION_REQUESTED],
+                ),
+                workspace_model(
+                    id="workspace_id",
+                    status=Status.DELETING,
+                    status_history=[Status.CREATION_REQUESTED, Status.DELETING],
+                    deletion_date=RUN_NOW,
+                ),
+                workspace_model(
+                    id="workspace_id",
+                    status=Status.DELETED,
+                    status_history=[
+                        Status.CREATION_REQUESTED,
+                        Status.DELETING,
+                        Status.DELETED,
+                    ],
+                    deletion_date=RUN_NOW,
+                ),
+            ],
+            [
+                {
+                    "status": Status.DELETING,
+                    "status_history": [Status.CREATION_REQUESTED, Status.DELETING],
+                },
+                {
+                    "status": Status.DELETED,
+                    "status_history": [
+                        Status.CREATION_REQUESTED,
+                        Status.DELETING,
+                        Status.DELETED,
+                    ],
+                },
+            ],
+        ],
+        # index 1 — CREATING -> raises WorkspaceDeletionFailedError
+        [
+            [workspace_model(status=Status.CREATING)] * 2,
+            {
+                "expected_exception": WorkspaceDeletionFailedError,
+                "match": "Cannot delete WorkspaceAlias with id 'workspace_id'",
+            },
+        ],
+        # index 2 — ACTIVE -> goes through DELETING -> DELETED
+        [
+            [
+                workspace_model(
+                    id="workspace_id",
+                    status=Status.ACTIVE,
+                    status_history=[Status.DELETION_REQUESTED],
+                )
+            ] * 2
+            + [
+                workspace_model(
+                    id="workspace_id",
+                    status=Status.DELETING,
+                    status_history=[Status.DELETION_REQUESTED, Status.DELETING],
+                ),
+                workspace_model(
+                    id="workspace_id",
+                    status=Status.DELETED,
+                    status_history=[Status.DELETION_REQUESTED, Status.DELETING],
+                ),
+            ],
+            [
+                {
+                    "status": Status.DELETING,
+                    "status_history": [
+                        Status.DELETION_REQUESTED,
+                        Status.DELETING,
+                    ],
+                }
+            ],
+        ],
+        # index 3 — already DELETED -> no calls needed
+        [
+            [workspace_model(id="workspace_id", status=Status.DELETED)],
+            [],
+        ],
+        # index 4 — FAILED -> now deletable after our fix
+        [
+            [
+                workspace_model(
+                    id="workspace_id",
+                    status=Status.FAILED,
+                    status_history=[Status.FAILED],
+                ),
+                workspace_model(
+                    id="workspace_id",
+                    status=Status.DELETED,
+                    status_history=[Status.FAILED, Status.DELETED],
+                    deletion_date=RUN_NOW,
+                ),
+            ],
+            [
+                {
+                    "status": Status.DELETED,
+                    "status_history": [Status.FAILED, Status.DELETED],
+                },
+            ],
+        ],
+        # index 5 — unknown string status "toto" -> raises WorkspaceDeletionFailedError
+        [
+            [workspace_model(status="toto")] * 2,
+            {
+                "expected_exception": WorkspaceDeletionFailedError,
+                "match": "Cannot delete WorkspaceAlias with id 'workspace_id'",
+            },
+        ],
+    ],
+)
+@pytest.mark.unit
+@pytest.mark.component
+def test_delete(
+    mock_repository,
+    mocked_workspace_service,
+    grafana_service_with_mock,
+    input_app,
+    calls,
+    mocker_post,
+    mocker,
+):
+    mocker.patch(
+        "dataviz_core.adapters.requests_http_client.RequestsHTTPClient.post",
+        return_value=mocker_post,
+    )
+    mock_repository.workspace.get_by_id.side_effect = input_app
+    if isinstance(input_app[0].status, str):
+        mocked_workspace_service._refresh_workspace = Mock(side_effect=input_app)
+    else:
+        mocked_workspace_service._refresh_workspace = Mock(side_effect=input_app)
+    mocker.patch("dataviz_core.models.utils.utcnow", return_value=RUN_NOW)
+    if "expected_exception" in calls:
+        with pytest.raises(**calls):
+            mocked_workspace_service.delete_workspace("workspace_id")
+        return
+    mocked_workspace_service.delete_workspace("workspace_id")
+    # Ensure the iterable is not empty before iterating
+    if input_app:
+        mock_repository.workspace.update.assert_has_calls(
+            [call(id="workspace_id", **kwargs) for kwargs in calls]
+        )
