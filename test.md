@@ -1,16 +1,14 @@
-Good — `SimpleNamespace` IS applied. But the test is still failing because the `_delete_workspace` code is checking `if workspace.sg_connect is not None` but something else is going wrong.
-
-Run this to see what your `_delete_workspace` currently looks like:
+The guard IS in `_delete_workspace` (line 447) — that's correct. But the test is calling `_delete_workspace` which is at line 440, not `_deactivate_workspace` at line 941. Let me check what's actually at line 440:
 
 ```bash
-grep -n "sg_connect" dataviz_core/services/workspace.py
+sed -n '440,490p' dataviz_core/services/workspace.py
 ```
 
-Share the output. I need to see if the `if workspace.sg_connect is not None:` guard is actually in the code or not. Because if the guard isn't there, it'll call `remove_redirect_url` regardless of whether `sg_connect` is `None`.
+Share that output — I need to see the full `_delete_workspace` function body to confirm the guard is there.
 
 Also run:
 ```bash
-sed -n '930,960p' dataviz_core/services/workspace.py
+sed -n '760,800p' tests/services/test_workspace.py
 ```
 
-That'll show the actual `_deactivate_workspace` or `_delete_workspace` function body where the sg_connect call happens. Share both outputs.
+To see exactly what the test looks like now after the SimpleNamespace fix was applied.
