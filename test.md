@@ -1,20 +1,55 @@
-Yes — applying this fix will make `test_delete_workspace_sg_connect_none_skips_gracefully` pass.
-
-But let me also address `test_delete[input_app4-calls4]` which is still failing. The error shows:
+Now I can see it. `_poll_deletion` calls `_poll_status` which polls until status reaches `DELETED`. It keeps calling `get_by_id` until it gets `DELETED`. So for the FAILED scenario, the flow is:
 
 ```
-Expected: status=DELETED
-Actual:   status=DELETING
+delete_workspace(FAILED, is_failed=False)
+  → our fix: calls _delete_workspace(workspace)
+  → _delete_workspace: sets DELETING
+  → back in delete_workspace: now status is DELETING
+  → hits: if workspace.status is Status.DELETING: return self._poll_deletion(workspace)
+  → _poll_deletion keeps calling get_by_id until DELETED
 ```
 
-This means the mock runs out of workspace objects after `DELETING` — the test never sees the `DELETED` call because `_poll_deletion` is being called and consuming more items from the side_effect list than expected.
+So the side_effect list needs **3 items**:
+1. `FAILED` — first `get_by_id` call
+2. `DELETING` — after `_refresh_workspace`
+3. `DELETED` — `_poll_deletion` polls until it gets this
 
-Run this to see what `_poll_deletion` does:
+Replace index 4 in the parametrize list with:
 
-```bash
-sed -n '603,625p' dataviz_core/services/workspace.py
+```python
+# index 4 — FAILED -> _delete_workspace sets DELETING -> _poll_deletion gets DELETED
+[
+    [
+        workspace_model(
+            id="workspace_id",
+            status=Status.FAILED,
+            status_history=[Status.FAILED],
+        ),
+        workspace_model(
+            id="workspace_id",
+            status=Status.DELETING,
+            status_history=[Status.FAILED, Status.DELETING],
+            deletion_date=RUN_NOW,
+        ),
+        workspace_model(
+            id="workspace_id",
+            status=Status.DELETED,
+            status_history=[Status.FAILED, Status.DELETING, Status.DELETED],
+            deletion_date=RUN_NOW,
+        ),
+    ],
+    [
+        {
+            "status": Status.DELETING,
+            "status_history": [Status.FAILED, Status.DELETING],
+        },
+    ],
+],
 ```
 
-Share the output. The `FAILED → DELETING` transition works but something after that is consuming extra mock items before `DELETED` can be reached.
+Key points:
+- 3 workspace models in side_effect — `FAILED`, `DELETING`, `DELETED`
+- Expected calls only has `DELETING` — because `_poll_deletion` doesn't call `update`, it just polls `get_by_id` until `DELETED`
+- `DELETED` is reached by polling, not by an explicit update call — so it's NOT in the expected calls list
 
-But to answer your question directly — **yes, the `SimpleNamespace` fix solves the sg_connect test**. The `input_app4` fix needs the `_poll_deletion` output before I can give you the exact right number of workspace models to put in the side_effect list.
+After applying this, run pytest. Both failures should be gone.
