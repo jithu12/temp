@@ -12,8 +12,7 @@ This means the mock runs out of workspace objects after `DELETING` — the test 
 Run this to see what `_poll_deletion` does:
 
 ```bash
-grep -n "def _poll_deletion" dataviz_core/services/workspace.py
-sed -n '<that_line>,<that_line+20>p' dataviz_core/services/workspace.py
+sed -n '603,625p' dataviz_core/services/workspace.py
 ```
 
 Share the output. The `FAILED → DELETING` transition works but something after that is consuming extra mock items before `DELETED` can be reached.
