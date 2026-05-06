@@ -1,61 +1,73 @@
-No — that function is already correct. What I need you to do first is add **temporary debug logs** to find out exactly where the status update is failing.
+Crystal clear. The error is:
 
-Add these 2 lines temporarily in your server's `accounts.py`, inside `request_account_deactivation`, right before the final return:
+```
+TypeError: update_resource_with() missing 1 required positional argument: 'repository'
+```
 
-Find this at the bottom of the function:
+My `_update_account_with` is calling `update_resource_with` with wrong argument names. The original code used `repositories=` but the actual function signature requires `repository=` (singular, no `s`).
+
+Check the exact signature right now:
+
+```bash
+grep -n "def update_resource_with" dataviz_core/utils/__init__.py
+# or
+grep -rn "def update_resource_with" dataviz_core/
+```
+
+Share what comes back. But based on the error, the fix is one of these two things in `_update_account_with`:
+
+**Option A — wrong keyword name (`repositories` vs `repository`):**
 ```python
-self.workflow_executor.async_exec_core_function(
-    service="account",
-    function="deactivate_account",
-    kwargs={"owner_account_id": owner_account_id},
+# Current (wrong)
+actual_changes = update_resource_with(
+    ctx_manager=self.autocommit(),
+    repositories=self.repositories.account_details,  # ← wrong keyword
+    resource=account,
+    logger=self.logger,
+    **changes,
 )
 
-return self._update_account_with_and_return(
+# Fix
+actual_changes = update_resource_with(
+    ctx_manager=self.autocommit(),
+    repository=self.repositories.account_details,    # ← singular
+    resource=account,
+    logger=self.logger,
+    **changes,
+)
+```
+
+**Option B — positional argument (no keyword at all):**
+```python
+actual_changes = update_resource_with(
+    self.autocommit(),
+    self.repositories.account_details,
     account,
-    status=Status.INACTIVE
+    self.logger,
+    **changes,
 )
 ```
 
-Change to:
-```python
-self.workflow_executor.async_exec_core_function(
-    service="account",
-    function="deactivate_account",
-    kwargs={"owner_account_id": owner_account_id},
-)
+## How to find the correct signature
 
-self.logger.error(f"DEBUG BEFORE UPDATE: account.status = {account.status!r}")
-result = self._update_account_with_and_return(account, status=Status.INACTIVE)
-self.logger.error(f"DEBUG AFTER UPDATE: result.status = {result.status!r}")
-return result
+Run:
+```bash
+grep -rn "def update_resource_with" dataviz_core/
 ```
 
-Also add the same two lines in the `if len(workspaces) == 0` block:
-```python
-if len(workspaces) == 0:
-    self.logger.info(
-        f"No active workspaces found for owner_account_id: {owner_account_id}"
-    )
-    self.logger.error(f"DEBUG BEFORE UPDATE: account.status = {account.status!r}")
-    result = self._update_account_with_and_return(account, status=Status.INACTIVE)
-    self.logger.error(f"DEBUG AFTER UPDATE: result.status = {result.status!r}")
-    return result
+Then share the function signature line. OR look at how other services call it:
+```bash
+grep -rn "update_resource_with(" dataviz_core/services/workspace.py | head -5
 ```
 
-Then:
-1. Restart API server
-2. Call deactivate in Swagger with a real UUID
-3. Check the API server logs — find the two `DEBUG` lines
-4. Also run this SQL immediately after:
+That'll show you the exact argument names workspace.py uses — since workspace works correctly, match that exact pattern.
 
-```sql
-SELECT owner_account_id, status 
-FROM public.api_account_details
-WHERE owner_account_id = 'your-real-uuid';
+## Also — still using fake UUID
+
+```
+target_account_id: bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb
 ```
 
-Share:
-- The two DEBUG log lines
-- The SQL result
+You're still testing with a fake UUID. Once we fix the `update_resource_with` error, please test with a real `owner_account_id` from your DB — otherwise you'll keep hitting `AccountNotFoundException` and related issues.
 
-That will tell me exactly where it's breaking — whether `_update_account_with_and_return` is failing silently, or whether the DB is updating but the response is wrong, or something else. Then I'll give you the precise fix.
+Share the `grep` output and I'll give you the one-line fix.
