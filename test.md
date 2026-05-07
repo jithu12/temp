@@ -1,13 +1,4 @@
-`_delete_deployment` only deletes the **Kubernetes deployment** (the pod/container) — it does NOT delete persistent volumes or the database. The database connection is stored separately via `stack.database.vault_secret_id` which is a reference to an external database, not data inside the pod.
-
-**This means Grafana data IS preserved across deactivate/reactivate.** ✅
-
-The database survives because:
-- Grafana data lives in the **external database** (`stack.database`) — not in the pod
-- `_delete_deployment` only removes the pod
-- The database record and its vault secret are untouched during deactivation
-
-Now I'm confident the fix is safe. Here's the final `_activate_workspace` to replace in `workspace.py`:
+Yes — replace the entire function with this:
 
 ```python
 def _activate_workspace(self, workspace: Workspace) -> Workspace:
@@ -24,15 +15,15 @@ def _activate_workspace(self, workspace: Workspace) -> Workspace:
         # Reset the existing stack back to CREATION_REQUESTED
         # so the async create_stack job will recreate all
         # Kubernetes resources (ingress, deployment, secrets etc.)
-        # using the same stack ID, namespace and database — 
+        # using the same stack ID, namespace and database —
         # preserving all Grafana data
         self._kube_service._update_stack_with(
             kube_stack,
             status=Status.CREATION_REQUESTED,
         )
 
-        # Fire async job using the EXISTING stack id
-        # not a new one — this is key for data preservation
+        # Fire async job using the EXISTING stack id — not a new one
+        # This is key for data preservation
         self._kube_service.workflow_executor.async_exec_core_function(
             service="kube",
             function="create_stack",
@@ -61,30 +52,31 @@ def _activate_workspace(self, workspace: Workspace) -> Workspace:
     )
 ```
 
-## Why this is correct and safe
+## What changed vs your current version
 
-| Step | What happens |
-|---|---|
-| `kube_stack = workspace.kube_stack` | Gets the existing stack — same ID, same namespace, same DB |
-| `_update_stack_with(status=CREATION_REQUESTED)` | Resets stack status so `create_stack` will process it |
-| `async_exec_core_function(create_stack, stack_id=kube_stack.id)` | Fires job with EXISTING stack ID |
-| Celery picks up `create_stack` | Calls `_refresh_stack` → returns early (CREATION_REQUESTED) → calls `_create_stack` |
-| `_create_stack` | Recreates HPA, Ingress, Config, Service, Secrets, Deployment |
-| Same database connected | All Grafana data intact ✅ |
-| Ingress restored | Grafana login page works again ✅ |
+**Before — creates a NEW kube stack:**
+```python
+self._kube_service.request_stack_creation(
+    ws_name=workspace.name,
+    name=workspace.kube_stack.name,  # uses old name but creates new record
+    ...
+)
+```
+This inserts a new `KubeStack` row in DB with a new ID. The workspace still points to the old deleted stack. Nothing reconnects. Grafana stays broken.
 
-## After applying
-
-```bash
-find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null
-python app.py
-celery -A dataviz_async.app:app worker
+**After — reuses the EXISTING kube stack:**
+```python
+self._kube_service._update_stack_with(
+    kube_stack,
+    status=Status.CREATION_REQUESTED,  # resets existing stack
+)
+self._kube_service.workflow_executor.async_exec_core_function(
+    service="kube",
+    function="create_stack",
+    kwargs={"stack_id": kube_stack.id},  # same ID as before
+)
 ```
 
-Then test the full lifecycle:
-1. Add some data in Grafana
-2. Call deactivate → Grafana shows 404
-3. Call activate → wait ~30 seconds for async job
-4. Refresh Grafana → login page loads, data still there
+Same stack record, same namespace, same database connection — all Grafana data preserved. `create_stack` sees `CREATION_REQUESTED` and rebuilds all the Kubernetes resources (ingress, deployment, secrets) restoring Grafana access.
 
-The 30 second wait is because `create_stack` is async — Celery picks it up and recreates all the Kubernetes resources in the background.
+After applying, clear pycache and restart both API server and Celery worker.
