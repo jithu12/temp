@@ -119,9 +119,10 @@ class ModuleHealthBlock:
     rootcause: Optional[str] = None
 
     def asdict(self) -> dict[str, Any]:
+        # Keys in alphabetical order to match the Platform Health Standard format
         result = {
-            "name": self.name,
             "description": self.description,
+            "name": self.name,
             "status": str(self.status),
         }
         if self.tags is not None:
@@ -171,12 +172,13 @@ class HealthResult:
         modules: List of module health blocks
     """
 
+    # Fields in alphabetical order to match the Platform Health Standard format
+    comment: str
     description: str
-    version: str
+    modules: list[dict[str, Any]]
     status: str
     time: str
-    comment: str
-    modules: list[dict[str, Any]]
+    version: str
 
     @staticmethod
     def from_modules(
@@ -215,12 +217,12 @@ class HealthResult:
         comment = _build_health_comment(app_status, modules)
 
         return HealthResult(
+            comment=comment,
             description=description,
-            version=version,
+            modules=modules,
             status=str(app_status),
             time=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f"),
-            comment=comment,
-            modules=modules,
+            version=version,
         )
 
     def asdict(self) -> dict[str, Any]:
