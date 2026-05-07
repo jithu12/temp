@@ -1,55 +1,34 @@
-Now I can see it. `_poll_deletion` calls `_poll_status` which polls until status reaches `DELETED`. It keeps calling `get_by_id` until it gets `DELETED`. So for the FAILED scenario, the flow is:
+OK let me think about this carefully before we touch anything.
 
-```
-delete_workspace(FAILED, is_failed=False)
-  → our fix: calls _delete_workspace(workspace)
-  → _delete_workspace: sets DELETING
-  → back in delete_workspace: now status is DELETING
-  → hits: if workspace.status is Status.DELETING: return self._poll_deletion(workspace)
-  → _poll_deletion keeps calling get_by_id until DELETED
-```
+## First — understand what deactivation SHOULD do vs what it's doing
 
-So the side_effect list needs **3 items**:
-1. `FAILED` — first `get_by_id` call
-2. `DELETING` — after `_refresh_workspace`
-3. `DELETED` — `_poll_deletion` polls until it gets this
+Based on the PPT and the architecture, deactivation should **suspend** the workspace — not destroy it. The data should be preserved. When reactivated, everything should come back exactly as it was.
 
-Replace index 4 in the parametrize list with:
+But right now `_deactivate_workspace` calls `request_stack_deletion` which is a **DELETE** operation — it's tearing down the Kubernetes stack entirely. That's why Grafana shows 404 — the ingress is gone.
 
-```python
-# index 4 — FAILED -> _delete_workspace sets DELETING -> _poll_deletion gets DELETED
-[
-    [
-        workspace_model(
-            id="workspace_id",
-            status=Status.FAILED,
-            status_history=[Status.FAILED],
-        ),
-        workspace_model(
-            id="workspace_id",
-            status=Status.DELETING,
-            status_history=[Status.FAILED, Status.DELETING],
-            deletion_date=RUN_NOW,
-        ),
-        workspace_model(
-            id="workspace_id",
-            status=Status.DELETED,
-            status_history=[Status.FAILED, Status.DELETING, Status.DELETED],
-            deletion_date=RUN_NOW,
-        ),
-    ],
-    [
-        {
-            "status": Status.DELETING,
-            "status_history": [Status.FAILED, Status.DELETING],
-        },
-    ],
-],
+This is a fundamental design question: **should deactivation call `request_stack_deletion` or something else?**
+
+Let me see what kube operations are available:
+
+```bash
+grep -n "def request_stack" dataviz_core/services/kube.py
 ```
 
-Key points:
-- 3 workspace models in side_effect — `FAILED`, `DELETING`, `DELETED`
-- Expected calls only has `DELETING` — because `_poll_deletion` doesn't call `update`, it just polls `get_by_id` until `DELETED`
-- `DELETED` is reached by polling, not by an explicit update call — so it's NOT in the expected calls list
+And:
+```bash
+grep -n "def request_" dataviz_core/services/kube.py | head -30
+```
 
-After applying this, run pytest. Both failures should be gone.
+Share those outputs. I need to see ALL available kube operations — there might be a `request_stack_suspension` or `request_stack_pause` or similar that should be used instead of deletion.
+
+Also check:
+```bash
+grep -n "def request_stack" dataviz_core/adapters/kube_client.py
+```
+
+And let me see what `_activate_workspace` does vs what it should do:
+```bash
+sed -n '860,910p' dataviz_core/services/workspace.py
+```
+
+Share all of those and I'll give you a proper fix. I don't want to guess at the kube layer — one wrong call could make things worse.
