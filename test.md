@@ -1,34 +1,37 @@
-OK let me think about this carefully before we touch anything.
+OK this is very clear now. There are only two kube operations available:
 
-## First — understand what deactivation SHOULD do vs what it's doing
+- `request_stack_creation` — creates/recreates a stack
+- `request_stack_deletion` — deletes a stack permanently
 
-Based on the PPT and the architecture, deactivation should **suspend** the workspace — not destroy it. The data should be preserved. When reactivated, everything should come back exactly as it was.
+**There is no suspend/pause operation.** This means the architecture uses creation and deletion for activate/deactivate. The data preservation question depends on whether the database and storage volumes are preserved when the stack is deleted.
 
-But right now `_deactivate_workspace` calls `request_stack_deletion` which is a **DELETE** operation — it's tearing down the Kubernetes stack entirely. That's why Grafana shows 404 — the ingress is gone.
-
-This is a fundamental design question: **should deactivation call `request_stack_deletion` or something else?**
-
-Let me see what kube operations are available:
+Before touching anything, I need to understand the full picture. Run these:
 
 ```bash
-grep -n "def request_stack" dataviz_core/services/kube.py
+sed -n '1299,1350p' dataviz_core/services/kube.py
 ```
 
-And:
 ```bash
-grep -n "def request_" dataviz_core/services/kube.py | head -30
+sed -n '129,200p' dataviz_core/services/kube.py
 ```
 
-Share those outputs. I need to see ALL available kube operations — there might be a `request_stack_suspension` or `request_stack_pause` or similar that should be used instead of deletion.
-
-Also check:
 ```bash
-grep -n "def request_stack" dataviz_core/adapters/kube_client.py
+grep -n "def _activate_workspace\|def _deactivate_workspace" dataviz_core/services/workspace.py
 ```
 
-And let me see what `_activate_workspace` does vs what it should do:
+Then share the `_activate_workspace` function:
 ```bash
-sed -n '860,910p' dataviz_core/services/workspace.py
+grep -n "def _activate_workspace" dataviz_core/services/workspace.py
 ```
 
-Share all of those and I'll give you a proper fix. I don't want to guess at the kube layer — one wrong call could make things worse.
+Then:
+```bash
+sed -n '<that_line>,<that_line+40>p' dataviz_core/services/workspace.py
+```
+
+Share all of those. I need to see:
+1. What `request_stack_deletion` actually does — does it delete the DB/volumes or just the ingress/pods?
+2. What `request_stack_creation` does — does it recreate from scratch or restore existing data?
+3. What `_activate_workspace` passes to `request_stack_creation`
+
+This will tell us whether data can be preserved across deactivate/reactivate cycles, and what the correct fix is. Don't want to guess on this one — if we pass wrong params to kube creation we could make things worse.
