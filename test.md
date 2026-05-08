@@ -1,82 +1,68 @@
-Yes — replace the entire function with this:
+Now I can see exactly what's happening. Two separate issues:
 
-```python
-def _activate_workspace(self, workspace: Workspace) -> Workspace:
-    self.logger.info(f"Reactivating {logname(workspace)}...")
-    try:
-        kube_stack = workspace.kube_stack
+## Issue 1 — Deactivation log
 
-        if kube_stack is None:
-            self.logger.error(
-                f"{logname(workspace)}: No kube stack found — cannot reactivate"
-            )
-            raise WorkspaceActivationFailedError(workspace.id)
-
-        # Reset the existing stack back to CREATION_REQUESTED
-        # so the async create_stack job will recreate all
-        # Kubernetes resources (ingress, deployment, secrets etc.)
-        # using the same stack ID, namespace and database —
-        # preserving all Grafana data
-        self._kube_service._update_stack_with(
-            kube_stack,
-            status=Status.CREATION_REQUESTED,
-        )
-
-        # Fire async job using the EXISTING stack id — not a new one
-        # This is key for data preservation
-        self._kube_service.workflow_executor.async_exec_core_function(
-            service="kube",
-            function="create_stack",
-            kwargs={
-                "stack_id": kube_stack.id,
-                "temp_ns_check": False,
-            },
-        )
-
-        self.logger.info(
-            f"{logname(workspace)}: Kube stack reactivation requested "
-            f"for stack_id={kube_stack.id}"
-        )
-
-    except WorkspaceActivationFailedError:
-        raise
-    except Exception as e:
-        self.logger.exception(
-            f"{logname(workspace)}: '{workspace.name}' kube reactivation failed. "
-            f"Error: {e}"
-        )
-
-    return self._update_workspace_with_and_return(
-        workspace,
-        status=Status.ACTIVE,
-    )
+```
+Error while deleting LDAP ConfigMap...
+Error while deleting Service...
+Error while deleting Fluentd ConfigMap...
+Error while deleting Secret... (3 times)
+Workspace already inactive
 ```
 
-## What changed vs your current version
+The kube deletion is partially failing — some resources can't be deleted (probably already gone or permission issues in dev). But the last line says **"Workspace already inactive"** — which means the workspace IS being marked INACTIVE in the DB. The deactivation IS working from a DB perspective.
 
-**Before — creates a NEW kube stack:**
-```python
-self._kube_service.request_stack_creation(
-    ws_name=workspace.name,
-    name=workspace.kube_stack.name,  # uses old name but creates new record
-    ...
-)
+## Issue 2 — Reactivation log — THIS is the real problem
+
 ```
-This inserts a new `KubeStack` row in DB with a new ID. The workspace still points to the old deleted stack. Nothing reconnects. Grafana stays broken.
-
-**After — reuses the EXISTING kube stack:**
-```python
-self._kube_service._update_stack_with(
-    kube_stack,
-    status=Status.CREATION_REQUESTED,  # resets existing stack
-)
-self._kube_service.workflow_executor.async_exec_core_function(
-    service="kube",
-    function="create_stack",
-    kwargs={"stack_id": kube_stack.id},  # same ID as before
-)
+Cannot activate Workspace while it's already ACTIVE
+Reactivation failed for Workspace
 ```
 
-Same stack record, same namespace, same database connection — all Grafana data preserved. `create_stack` sees `CREATION_REQUESTED` and rebuilds all the Kubernetes resources (ingress, deployment, secrets) restoring Grafana access.
+When `reactivate_workspace` is called, it calls `_refresh_workspace` first:
 
-After applying, clear pycache and restart both API server and Celery worker.
+```python
+workspace = self._refresh_workspace(workspace.id)
+```
+
+`_refresh_workspace` checks Kubernetes and sees the stack is still somewhat ACTIVE (because kube deletion partially failed — some resources like the deployment still exist). So it returns the workspace with status `ACTIVE`. Then:
+
+```python
+if workspace.status is Status.ACTIVE:
+    raise WorkspaceActivationFailedError(workspace.id)  # ← raises here!
+```
+
+The workspace DB says `INACTIVE` but `_refresh_workspace` sees Kubernetes still has some resources → reports `ACTIVE` → activation fails.
+
+## The root cause chain
+
+```
+Deactivation → kube deletion partially fails
+             → some kube resources still exist (deployment maybe)
+             → _refresh_workspace sees them → reports ACTIVE
+             → reactivate_workspace rejects it
+             → Grafana stays at 404
+```
+
+## The fix — in `reactivate_workspace`
+
+The problem is `_refresh_workspace` is updating the DB status based on what Kubernetes reports. We need to bypass the refresh check and force activation regardless.
+
+Find `reactivate_workspace` in `workspace.py` and share it:
+
+```bash
+grep -n "def reactivate_workspace" dataviz_core/services/workspace.py
+sed -n '<that_line>,<that_line+30>p' dataviz_core/services/workspace.py
+```
+
+Or run:
+```bash
+grep -n "def reactivate_workspace" dataviz_core/services/workspace.py
+```
+
+Then:
+```bash
+sed -n '1060,1100p' dataviz_core/services/workspace.py
+```
+
+Share the output. Based on what we've seen, the fix will be to skip `_refresh_workspace` during account-level reactivation — or to handle the case where `_refresh_workspace` reports `ACTIVE` but DB says `INACTIVE` by trusting the DB status instead of Kubernetes.
