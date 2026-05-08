@@ -77,3 +77,44 @@ kubectl delete ingress a-977791-ingress -n ns-daz-471936-dev-dv-b2b94
 Then restart Celery and try activating again. Once the namespace is clean, `create_stack` should be able to create everything fresh.
 
 Share the `kubectl get pods` and `kubectl get events` output and I can tell you exactly what's blocking the pods from starting.
+
+
+
+The 503 nginx error is actually **progress** compared to the 404. Here's what each means:
+
+- **404 "default backend"** — ingress doesn't exist at all, no routing configured
+- **503 nginx** — ingress EXISTS and is routing traffic, but the backend service/pod isn't responding yet
+
+This means `create_stack` **partially worked** — it created the ingress. But the pod isn't ready yet, so nginx can't reach it → 503.
+
+## Check pod status right now
+
+```bash
+kubectl get pods -n ns-daz-471936-dev-dv-b2b94
+```
+
+It will show something like:
+
+```
+NAME                                    READY   STATUS             RESTARTS
+a-977791-deployment-xxx                 0/1     CrashLoopBackOff   3
+# or
+a-977791-deployment-xxx                 0/1     ImagePullBackOff   0
+# or
+a-977791-deployment-xxx                 0/1     Pending            0
+```
+
+Share what you see. The STATUS column tells us exactly why it's not ready:
+
+- `CrashLoopBackOff` → pod starts but crashes immediately → check logs
+- `ImagePullBackOff` → can't pull the Docker image → registry/auth issue
+- `Pending` → waiting for resources → cluster capacity issue
+- `ContainerCreating` → still starting → wait a bit longer
+
+## Also check events
+
+```bash
+kubectl get events -n ns-daz-471936-dev-dv-b2b94 --sort-by='.lastTimestamp' | tail -20
+```
+
+Share both outputs and I'll tell you exactly what's blocking the pod from starting and how to fix it.
