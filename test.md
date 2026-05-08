@@ -1,158 +1,79 @@
-Sure! Here's a clean summary of all fixes you need to apply in `dataviz_core/services/workspace.py`:
+Good news and bad news.
 
-## Fix 1 — `_activate_workspace`
+**Good news** — the fix is working. `create_stack` IS being called with the existing stack ID, which means `_activate_workspace` fix is correct. The kube reactivation flow is triggering properly.
 
-Find and replace the entire function:
+**Bad news** — the pods aren't starting. `check_deployment_pods_running` is recursively checking if pods are up, hitting the retry limit, and failing. This means the Kubernetes deployment was created but the pods aren't becoming healthy.
 
-```python
-def _activate_workspace(self, workspace: Workspace) -> Workspace:
-    self.logger.info(f"Reactivating {logname(workspace)}...")
-    try:
-        kube_stack = workspace.kube_stack
+## Why pods aren't running
 
-        if kube_stack is None:
-            self.logger.error(
-                f"{logname(workspace)}: No kube stack found — cannot reactivate"
-            )
-            raise WorkspaceActivationFailedError(workspace.id)
+This is a dev environment issue. When `_create_stack` creates the deployment, Kubernetes tries to pull the Grafana image and start the pod. In dev, this can fail because:
 
-        # Reset the existing stack back to CREATION_REQUESTED
-        # so the async create_stack job will recreate all
-        # Kubernetes resources (ingress, deployment, secrets etc.)
-        # using the same stack ID, namespace and database —
-        # preserving all Grafana data
-        self._kube_service._update_stack_with(
-            kube_stack,
-            status=Status.CREATION_REQUESTED,
-        )
+1. The image pull fails (wrong registry, auth issues)
+2. The pod has resource constraints not met in dev
+3. The previous deployment wasn't fully cleaned up — conflicting resources exist
 
-        # Fire async job using the EXISTING stack id — not a new one
-        # This is key for data preservation
-        self._kube_service.workflow_executor.async_exec_core_function(
-            service="kube",
-            function="create_stack",
-            kwargs={
-                "stack_id": kube_stack.id,
-                "temp_ns_check": False,
-            },
-        )
+## Immediate fix — stop the retry loop
 
-        self.logger.info(
-            f"{logname(workspace)}: Kube stack reactivation requested "
-            f"for stack_id={kube_stack.id}"
-        )
-
-    except WorkspaceActivationFailedError:
-        raise
-    except Exception as e:
-        self.logger.exception(
-            f"{logname(workspace)}: '{workspace.name}' kube reactivation failed. "
-            f"Error: {e}"
-        )
-
-    return self._update_workspace_with_and_return(
-        workspace,
-        status=Status.ACTIVE,
-    )
-```
-
-## Fix 2 — `reactivate_workspace`
-
-Find and replace the entire function:
-
-```python
-def reactivate_workspace(self, workspace_id: uuid.UUID) -> Workspace:
-    workspace = self.repositories.workspace.get_by_id(workspace_id)
-
-    self.logger.info(f"Starting {logname(workspace)} Re-Activation")
-
-    # Trust the DB status — do NOT call _refresh_workspace here
-    # because if kube deletion partially failed during deactivation,
-    # _refresh_workspace will report ACTIVE from Kubernetes even though
-    # DB correctly says INACTIVE — causing activation to be rejected.
-    if workspace.status is Status.ACTIVE:
-        self.logger.error(
-            f"Cannot activate {logname(workspace)} "
-            f"while it's already {workspace.status}"
-        )
-        raise WorkspaceActivationFailedError(workspace.id)
-
-    if workspace.status is Status.INACTIVE:
-        # Trust DB — activate directly
-        return self._activate_workspace(workspace)
-
-    # Any other status — fail safely
-    self.logger.error(
-        f"Unknown status for {logname(workspace)}: {workspace.status}"
-    )
-    raise WorkspaceActivationFailedError(workspace.id)
-```
-
-## Fix 3 — `reactivate_workspaces_by_owner_account_id`
-
-Find and replace the entire function:
-
-```python
-def reactivate_workspaces_by_owner_account_id(
-    self,
-    account_activation_id: uuid.UUID,
-) -> List[Dict]:
-    workspace_updates = []
-    filters = [
-        FilteringCriterion("owner_account_id", account_activation_id),
-        FilteringCriterion("status", Status.INACTIVE),
-    ]
-    workspaces = self.repositories.workspace.list(filters=filters)
-    for workspace in workspaces:
-        _workspace_updates = {}
-        self.logger.info(
-            f"Requesting {logname(workspace)} Activation due to "
-            f"Account Activation request from account event lifecycle"
-        )
-        self.logger.debug(f"Requesting {logname(workspace)} Activation...")
-        try:
-            # Call _activate_workspace directly instead of reactivate_workspace
-            # because reactivate_workspace calls _refresh_workspace which checks
-            # Kubernetes status — if kube deletion partially failed during
-            # deactivation, Kubernetes may still report ACTIVE even though
-            # DB says INACTIVE, causing reactivate_workspace to reject it.
-            # We trust the DB filter above (status=INACTIVE) and force activation.
-            workspace_res = self._activate_workspace(workspace)
-
-            _workspace_updates["workspace_id"] = str(workspace_res.id)
-            _workspace_updates["status"] = "reactivated"
-            _workspace_updates["name"] = workspace_res.name
-            workspace_updates.append(_workspace_updates)
-
-        except WorkspaceActivationFailedError as e:
-            _workspace_updates["workspace_id"] = str(workspace.id)
-            _workspace_updates["status"] = "reactivation failed"
-            _workspace_updates["name"] = workspace.name
-            workspace_updates.append(_workspace_updates)
-            self.logger.error(
-                f"Reactivation failed for {logname(workspace)}. Error: {e}"
-            )
-            continue
-
-    self.logger.info(
-        f"Workspace reactivation process completed "
-        f"and workspace updates collected {workspace_updates}."
-    )
-    return workspace_updates
-```
-
-## After applying all three
+First, stop Celery worker to halt the retries:
 
 ```bash
-find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null
-python app.py
-celery -A dataviz_async.app:app worker
+# Find and kill the Celery worker
+ps aux | grep celery | grep -v grep
+kill <pid>
 ```
 
-## What each fix does in simple terms
+Then reset the stuck kube stack status in DB so it stops retrying:
 
-| Fix | What it fixes |
-|---|---|
-| `_activate_workspace` | Instead of creating a NEW kube stack, reuses the EXISTING one — preserving database and Grafana data |
-| `reactivate_workspace` | Removes `_refresh_workspace` call that was asking Kubernetes for status — Kubernetes was reporting wrong status after partial deletion, causing reactivation to be rejected |
-| `reactivate_workspaces_by_owner_account_id` | Calls `_activate_workspace` directly instead of going through `reactivate_workspace` — bypasses the Kubernetes status check entirely, trusts DB status instead |
+```sql
+-- Find the stuck stack
+SELECT id, name, status 
+FROM public.api_kube_stack 
+WHERE id = '01ee084c-7271-4aaa-86a9-f74812a10438';
+
+-- Reset it so it stops retrying
+UPDATE public.api_kube_stack 
+SET status = 'FAILED'
+WHERE id = '01ee084c-7271-4aaa-86a9-f74812a10438';
+```
+
+## Check what's happening in Kubernetes
+
+```bash
+# Check pod status in the workspace namespace
+kubectl get pods -n ns-daz-471936-dev-dv-b2b94
+
+# Check pod logs for the failing pod
+kubectl describe pod <pod-name> -n ns-daz-471936-dev-dv-b2b94
+
+# Check events in the namespace
+kubectl get events -n ns-daz-471936-dev-dv-b2b94 --sort-by='.lastTimestamp'
+```
+
+Share the output — this will tell us exactly why the pod isn't starting.
+
+## The real issue here
+
+This is not a code bug — it's an infrastructure issue. `_create_stack` is doing exactly what it should — creating the deployment and waiting for pods to be ready. But pods aren't becoming ready in dev.
+
+This is what your Lead needs to investigate — specifically:
+- Is the Grafana image available in the dev registry?
+- Are there leftover Kubernetes resources from the previous deletion that are conflicting?
+- Does the dev cluster have enough resources to run the pod?
+
+Check leftover resources:
+
+```bash
+kubectl get all -n ns-daz-471936-dev-dv-b2b94
+```
+
+If there are leftover resources from the failed deletion, clean them up first:
+
+```bash
+kubectl delete deployment a-977791-deployment -n ns-daz-471936-dev-dv-b2b94
+kubectl delete service a-977791-service -n ns-daz-471936-dev-dv-b2b94
+kubectl delete ingress a-977791-ingress -n ns-daz-471936-dev-dv-b2b94
+```
+
+Then restart Celery and try activating again. Once the namespace is clean, `create_stack` should be able to create everything fresh.
+
+Share the `kubectl get pods` and `kubectl get events` output and I can tell you exactly what's blocking the pods from starting.
