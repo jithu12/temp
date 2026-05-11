@@ -1,45 +1,30 @@
-Great question — and yes, **delete should remove everything** including the database. That's the difference between deactivate and delete:
+I understand completely. Right now the flow is:
 
-- **Deactivate** — suspend, keep all data, can come back
-- **Delete** — permanent, remove everything
-
-## What currently happens during delete
-
-Looking at `_delete_workspace` in `workspace.py`, it calls:
-
-```python
-self.sg_connect_service.remove_redirect_url(...)
-self._dataplane.request_component_deletion(component_id=workspace.dataplane_component.id)
-self._dataplane.vault.delete_secret(secret_id=workspace.dataplane_component.vault_secret_id)
-self._dns.request_dns_deletion(dns_id=workspace.dns_id)
-self._kube_service.request_namespace_deletion(
-    namespace_id=workspace.kube_stack.kube_namespace.id,
-    stack_id=workspace.kube_stack.id,
-)
+```
+Admin clicks deactivate → DB immediately shows INACTIVE → workspaces deactivated in background
 ```
 
-It deletes:
-- ✅ SG Connect redirect URL
-- ✅ Dataplane component
-- ✅ Vault secrets
-- ✅ DNS record
-- ✅ Kubernetes namespace (which removes ALL kube resources)
+Your Lead wants:
+```
+Admin clicks deactivate → DB shows DEACTIVATION_REQUESTED → workspaces deactivating in background → all done → DB shows INACTIVE
+Admin clicks activate → DB shows ACTIVATION_REQUESTED → workspaces activating in background → all done → DB shows ACTIVE
+```
 
-But I don't see the **database being explicitly deleted** here. Let me check:
+So the status endpoint would show intermediate states like `DEACTIVATION_REQUESTED` or `ACTIVATION_REQUESTED` while the async job is running, then flip to `INACTIVE` or `ACTIVE` when complete.
+
+## Good news — Core already supports this pattern
+
+Looking at `request_account_deactivation` — it already fires an async job. The issue is we're calling `_update_account_with_and_return(account, status=Status.INACTIVE)` **before** the async job completes. We need to change that to `Status.DEACTIVATION_REQUESTED` (or similar) and only set `INACTIVE` after the async job finishes in `deactivate_account`.
+
+## First — check what status values exist in Core
 
 ```bash
-grep -n "database\|delete_database\|request_database" dataviz_core/services/workspace.py | head -20
+grep -rn "DEACTIVATION_REQUESTED\|ACTIVATION_REQUESTED\|DELETING\|DELETION_REQUESTED" dataviz_core/models/shared_enums.py
 ```
 
 And:
 ```bash
-grep -n "def request_namespace_deletion" dataviz_core/services/kube.py
-sed -n '<that_line>,<that_line+40>p' dataviz_core/services/kube.py
+cat dataviz_core/models/shared_enums.py
 ```
 
-Share those outputs. I need to confirm whether:
-1. `request_namespace_deletion` also deletes the database
-2. Or the database deletion happens via `dataplane.request_component_deletion`
-3. Or the database is never deleted (which would be a bug)
-
-This is important to verify before your Lead's delete test — if the database isn't being deleted, data would persist in the DB even after a workspace deletion, which is a storage leak.
+Share the output. I need to see what Status enum values are already defined — your Lead may have already added `DEACTIVATION_REQUESTED` and `ACTIVATION_REQUESTED`. Once I know what's available I'll give you the exact changes needed in `accounts.py`.
