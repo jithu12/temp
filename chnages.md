@@ -1,41 +1,35 @@
-You can explain it like this in simple English during the meeting:
+Sure! Here's a clean summary:
 
----
+## Deactivate
 
-### First Error
+1. **API receives request** — admin calls `PATCH /admin/v1/accounts/{owner_account_id}/deactivate`
+2. **Admin gate check** — caller must be in `ALLOWED_ACCOUNT_IDS`
+3. **Account status check** — account must be `ACTIVE`
+4. **Async job fires** — Celery worker picks up `deactivate_account`
+5. **Account status** → `INACTIVE` in `api_account_details`
+6. **For each workspace** under that account:
+   - Calls `_deactivate_workspace`
+   - Deletes Kubernetes resources — ingress, deployment, HPA, service, secrets, config
+   - Workspace status → `INACTIVE` in `api_workspace`
+7. **Result** — Grafana shows 404, all data preserved in database
 
-```text
-FAILED ... StopIteration
-```
+## Activate
 
-You can say:
+1. **API receives request** — admin calls `PATCH /admin/v1/accounts/{owner_account_id}/activate`
+2. **Admin gate check** — caller must be in `ALLOWED_ACCOUNT_IDS`
+3. **Account status check** — account must be `INACTIVE`
+4. **Async job fires** — Celery worker picks up `reactivate_account`
+5. **Account status** → `ACTIVE` in `api_account_details`
+6. **For each workspace** under that account:
+   - Calls `_activate_workspace` directly (bypasses `_refresh_workspace` to avoid stale Kubernetes status)
+   - Resets existing KubeStack status → `CREATION_REQUESTED`
+   - Fires async `create_stack` job with same stack ID
+   - Kubernetes recreates — ingress, deployment, HPA, service, secrets, config
+   - Workspace status → `ACTIVE` in `api_workspace`
+7. **Result** — Grafana accessible again, all data intact ✅
 
-> "The first error happened because the test expected some data or response, but it became empty while running.
-> Looks like the code called something more times than expected."
+## Key points about data safety
 
-Or even simpler:
-
-> "The test was expecting another value, but there was no value left, so it failed with `StopIteration`."
-
----
-
-### Second Error
-
-```text
-Expected 'remove_redirect_url' to not have been called.
-Called 1 times.
-```
-
-You can say:
-
-> "The second test expected `remove_redirect_url` should not run when `sg_connect` is empty or None.
-> But during execution the function still got called once, so the test failed. (assertion issue)"
-
----
-
-### Final Overall Summary
-
-> "Only 2 tests failed out of more than 1100 tests.
-> Both failures are related to workspace delete functionality."
-
-This is enough for a team meeting and sounds natural for a new joiner.
+- **Database never touched** during either operation — all Grafana dashboards, users, data sources preserved
+- **Same KubeStack record reused** during activation — same database connection, same namespace
+- **Only Kubernetes resources** are removed/recreated — stateless components that can be safely rebuilt
