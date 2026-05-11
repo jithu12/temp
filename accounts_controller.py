@@ -1,6 +1,8 @@
+import os
 from typing import Tuple, Dict, Any
 from uuid import UUID
 
+from werkzeug.exceptions import HTTPException
 from flask import current_app, abort
 
 from dataviz_api.core import get_core
@@ -8,23 +10,29 @@ from platform_api.permissions import get_current_account_id
 
 
 # --------------------------------------------------------------------------
-# Admin allowlist
+# Admin accounts configuration
 # --------------------------------------------------------------------------
-# Only these two accounts are permitted to invoke the mutating admin
-# endpoints (deactivate / activate / delete). The same values should
-# also be configured in the Core ADMIN_ACCOUNTS env var for defense
-# in depth.
+_ADMIN_ACCOUNT_1 = "3c24a85d-f148-485e-96a9-c21d47b42f54"
+_ADMIN_ACCOUNT_2 = "d3ac47ac-cc43-4da7-b935-d0c0b1d4c7b9"
+
+os.environ.setdefault(
+    "ADMIN_ACCOUNTS",
+    f'["{_ADMIN_ACCOUNT_1}","{_ADMIN_ACCOUNT_2}"]',
+)
+
 ALLOWED_ACCOUNT_IDS = {
-    UUID("d3ac47ac-cc43-4da7-b935-d0c0b1d4c7b9"),
-    UUID("3c24a85d-f148-485e-96a9-c21d47b42f54"),
+    UUID(_ADMIN_ACCOUNT_1),
+    UUID(_ADMIN_ACCOUNT_2),
 }
+
+# Valid status transitions via the PATCH endpoint
+ALLOWED_STATUS_TRANSITIONS = {"ACTIVE", "INACTIVE"}
 
 
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
 def _get_accounts_service(core: Any) -> Any:
-    """Return the account service from core regardless of singular/plural naming."""
     service = getattr(core, "accounts", None) or getattr(core, "account", None)
     if service is None:
         raise RuntimeError("Account service is not available in core")
@@ -32,10 +40,6 @@ def _get_accounts_service(core: Any) -> Any:
 
 
 def _validate_allowed_account() -> UUID:
-    """
-    Block the request unless the logged-in account is one of the two
-    hardcoded admin accounts. Returns the caller's UUID on success.
-    """
     caller_account_id = get_current_account_id()
     try:
         caller_uuid = UUID(str(caller_account_id))
@@ -49,43 +53,44 @@ def _validate_allowed_account() -> UUID:
 
 
 def _parse_uuid(value: Any, field_name: str) -> UUID:
-    """Helper to parse UUIDs with a clear error message."""
     try:
         return UUID(str(value))
     except Exception:
-        raise ValueError(f"Invalid UUID provided for '{field_name}'")
+        raise ValueError(
+            f"Invalid UUID provided for '{field_name}'. "
+            f"Expected format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        )
 
 
 def _get_target_account_id(kwargs: Dict[str, Any]) -> UUID:
-    """
-    Extract the target account id from the path parameter. The path
-    parameter is named 'target_account_id' (not 'account_id') so that
-    it does not collide with the caller 'account_id' injected by the
-    auth middleware into kwargs.
-    """
     raw = kwargs.get("target_account_id")
     if raw is None:
-        raise ValueError("Missing required path parameter 'target_account_id'")
+        raise ValueError(
+            "Missing required path parameter 'target_account_id'."
+        )
     return _parse_uuid(raw, "target_account_id")
 
 
-def _account_to_response(account: Any) -> Dict[str, Any]:
-    """
-    Build the API response dict from an AccountDetails object returned
-    by Core. AccountDetails.status is a Status enum so we serialize
-    its .value as a string.
-    """
+def _get_caller_account_id(kwargs: Dict[str, Any]) -> UUID:
+    raw = kwargs.get("account_id")
+    if raw is None:
+        raise ValueError("Missing caller account_id from token")
+    return _parse_uuid(raw, "account_id")
+
+
+def _get_account_status(account: Any) -> str:
     raw_status = getattr(account, "status", None)
     if raw_status is None:
-        status = "UNKNOWN"
-    elif hasattr(raw_status, "value"):
-        status = str(raw_status.value)
-    else:
-        status = str(raw_status)
+        return "UNKNOWN"
+    if hasattr(raw_status, "value"):
+        return str(raw_status.value)
+    return str(raw_status)
 
+
+def _account_to_response(account: Any) -> Dict[str, Any]:
     response: Dict[str, Any] = {
         "id": str(getattr(account, "id", "")),
-        "status": status,
+        "status": _get_account_status(account),
     }
     owner = getattr(account, "owner_account_id", None)
     if owner is not None:
@@ -96,82 +101,191 @@ def _account_to_response(account: Any) -> Dict[str, Any]:
     return response
 
 
+def _check_account_exists(accounts_service: Any, owner_account_id: UUID) -> Any:
+    try:
+        return accounts_service.get_by_owner_id(str(owner_account_id))
+    except Exception as e:
+        if type(e).__name__ == "AccountNotFoundException":
+            raise
+        raise
+
+
 def _handle_core_exception(e: Exception) -> Tuple[Dict[str, Any], int]:
-    """
-    Map Core exceptions to HTTP status codes. Matched by class name so
-    the Core exceptions do not need to be imported here.
-    """
     name = type(e).__name__
+
     if name == "NotOwnerError":
-        return {"error": str(e) or "Not authorized"}, 403
+        return {
+            "error": "You are not authorized to perform admin operations.",
+            "code": "ADMIN_ACCESS_REQUIRED",
+        }, 403
+
     if name == "AccountNotFoundException":
-        return {"error": str(e) or "Account not found"}, 404
+        return {
+            "error": "Account not found. Please check the owner_account_id and try again.",
+            "code": "ACCOUNT_NOT_FOUND",
+        }, 404
+
     if name == "AccountNotInActiveException":
-        return {"error": str(e) or "Account is not in the required state"}, 409
-    return {"error": str(e) or "Unexpected error"}, 500
+        return {
+            "error": "Account is not in the required state for this operation.",
+            "code": "ACCOUNT_INVALID_STATE",
+        }, 409
+
+    return {
+        "error": f"An unexpected error occurred: {str(e)}",
+        "code": "INTERNAL_ERROR",
+    }, 500
+
+
+# --------------------------------------------------------------------------
+# Pre-flight status checks
+# --------------------------------------------------------------------------
+def _assert_account_is_active(account: Any, owner_account_id: UUID) -> None:
+    status = _get_account_status(account)
+    if status == "INACTIVE":
+        raise ValueError(
+            f"ACCOUNT_ALREADY_INACTIVE:"
+            f"Account '{owner_account_id}' is already inactive. "
+            f"No changes were made."
+        )
+    if status == "DELETED":
+        raise ValueError(
+            f"ACCOUNT_ALREADY_DELETED:"
+            f"Account '{owner_account_id}' has already been deleted. "
+            f"No changes were made."
+        )
+    if status != "ACTIVE":
+        raise ValueError(
+            f"ACCOUNT_INVALID_STATE:"
+            f"Account '{owner_account_id}' is in state '{status}' "
+            f"and cannot be deactivated. Only ACTIVE accounts can be deactivated."
+        )
+
+
+def _assert_account_is_inactive(account: Any, owner_account_id: UUID) -> None:
+    status = _get_account_status(account)
+    if status == "ACTIVE":
+        raise ValueError(
+            f"ACCOUNT_ALREADY_ACTIVE:"
+            f"Account '{owner_account_id}' is already active. "
+            f"No changes were made."
+        )
+    if status == "DELETED":
+        raise ValueError(
+            f"ACCOUNT_ALREADY_DELETED:"
+            f"Account '{owner_account_id}' has been deleted and cannot be reactivated. "
+            f"No changes were made."
+        )
+    if status != "INACTIVE":
+        raise ValueError(
+            f"ACCOUNT_INVALID_STATE:"
+            f"Account '{owner_account_id}' is in state '{status}' "
+            f"and cannot be reactivated. Only INACTIVE accounts can be reactivated."
+        )
+
+
+def _assert_account_is_deletable(account: Any, owner_account_id: UUID) -> None:
+    status = _get_account_status(account)
+    if status == "DELETED":
+        raise ValueError(
+            f"ACCOUNT_ALREADY_DELETED:"
+            f"Account '{owner_account_id}' has already been deleted. "
+            f"No changes were made."
+        )
+    if status not in ("ACTIVE", "INACTIVE"):
+        raise ValueError(
+            f"ACCOUNT_INVALID_STATE:"
+            f"Account '{owner_account_id}' is in state '{status}' "
+            f"and cannot be deleted. Only ACTIVE or INACTIVE accounts can be deleted."
+        )
+
+
+def _handle_state_error(e: ValueError) -> Tuple[Dict[str, Any], int]:
+    message = str(e)
+    code_map = {
+        "ACCOUNT_ALREADY_INACTIVE": (
+            "Account is already inactive. No changes were made.", 409
+        ),
+        "ACCOUNT_ALREADY_ACTIVE": (
+            "Account is already active. No changes were made.", 409
+        ),
+        "ACCOUNT_ALREADY_DELETED": (
+            "Account has been deleted and cannot be modified.", 409
+        ),
+        "ACCOUNT_INVALID_STATE": (
+            "Account is not in the required state for this operation.", 409
+        ),
+    }
+    for prefix, (friendly_message, status_code) in code_map.items():
+        if message.startswith(f"{prefix}:"):
+            detail = message.split(":", 1)[1].strip()
+            return {
+                "error": friendly_message,
+                "detail": detail,
+                "code": prefix,
+            }, status_code
+    return {"error": message, "code": "VALIDATION_ERROR"}, 400
 
 
 # --------------------------------------------------------------------------
 # Admin lifecycle endpoints
 # --------------------------------------------------------------------------
-def account_deactivate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
+def account_update_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     """
-    PATCH /admin/v1/accounts/{target_account_id}/deactivate
+    PATCH /admin/v1/accounts/{target_account_id}
 
-    Requests deactivation of the target account. The admin caller is
-    identified from the auth token and must be in ALLOWED_ACCOUNT_IDS.
-    """
-    core = get_core(current_app)
+    Updates account status to ACTIVE or INACTIVE.
+    Cascades the change to all associated workspaces.
 
-    try:
-        # Admin gate (first line of defense)
-        caller_account_id = _validate_allowed_account()
-
-        accounts_service = _get_accounts_service(core)
-
-        target_owner_account_id = _get_target_account_id(kwargs)
-
-        # Core contract:
-        #   owner_account_id -> target account being acted on
-        #   account_id       -> admin caller (checked against ADMIN_ACCOUNTS)
-        account = accounts_service.request_account_deactivation(
-            owner_account_id=target_owner_account_id,
-            account_id=caller_account_id,
-        )
-
-        return _account_to_response(account), 202
-
-    except ValueError as e:
-        return {"error": str(e)}, 400
-    except Exception as e:
-        return _handle_core_exception(e)
-
-
-def account_activate(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
-    """
-    PATCH /admin/v1/accounts/{target_account_id}/activate
-
-    Requests reactivation of the target account. The admin caller is
-    identified from the auth token and must be in ALLOWED_ACCOUNT_IDS.
+    Request body:
+        { "status": "INACTIVE" } -> deactivates the account and all workspaces
+        { "status": "ACTIVE" }   -> reactivates the account and all workspaces
     """
     core = get_core(current_app)
 
     try:
-        caller_account_id = _validate_allowed_account()
+        _validate_allowed_account()
 
         accounts_service = _get_accounts_service(core)
-
         target_owner_account_id = _get_target_account_id(kwargs)
+        caller_account_id = _get_caller_account_id(kwargs)
 
-        account = accounts_service.request_account_reactivation(
-            owner_account_id=target_owner_account_id,
-            account_id=caller_account_id,
-        )
+        # Get desired status from request body
+        body = kwargs.get("body") or {}
+        desired_status = body.get("status", "").upper()
+
+        if desired_status not in ALLOWED_STATUS_TRANSITIONS:
+            return {
+                "error": (
+                    f"Invalid status '{desired_status}'. "
+                    f"Must be one of: {', '.join(sorted(ALLOWED_STATUS_TRANSITIONS))}"
+                ),
+                "code": "INVALID_STATUS",
+            }, 400
+
+        # Pre-flight check
+        account = _check_account_exists(accounts_service, target_owner_account_id)
+
+        if desired_status == "INACTIVE":
+            _assert_account_is_active(account, target_owner_account_id)
+            account = accounts_service.request_account_deactivation(
+                owner_account_id=target_owner_account_id,
+                account_id=caller_account_id,
+            )
+
+        elif desired_status == "ACTIVE":
+            _assert_account_is_inactive(account, target_owner_account_id)
+            account = accounts_service.request_account_reactivation(
+                owner_account_id=target_owner_account_id,
+                account_id=caller_account_id,
+            )
 
         return _account_to_response(account), 202
 
     except ValueError as e:
-        return {"error": str(e)}, 400
+        return _handle_state_error(e)
+    except HTTPException:
+        raise
     except Exception as e:
         return _handle_core_exception(e)
 
@@ -180,18 +294,20 @@ def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     """
     DELETE /admin/v1/accounts/{target_account_id}
 
-    Requests deletion of the target account and all its associated
-    workspaces. The admin caller is identified from the auth token
-    and must be in ALLOWED_ACCOUNT_IDS.
+    Deletes the target account and all its associated workspaces.
+    Soft delete — records remain in DB with status DELETED.
     """
     core = get_core(current_app)
 
     try:
-        caller_account_id = _validate_allowed_account()
+        _validate_allowed_account()
 
         accounts_service = _get_accounts_service(core)
-
         target_owner_account_id = _get_target_account_id(kwargs)
+        caller_account_id = _get_caller_account_id(kwargs)
+
+        account = _check_account_exists(accounts_service, target_owner_account_id)
+        _assert_account_is_deletable(account, target_owner_account_id)
 
         account = accounts_service.request_account_deletion(
             owner_account_id=target_owner_account_id,
@@ -201,7 +317,9 @@ def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
         return _account_to_response(account), 202
 
     except ValueError as e:
-        return {"error": str(e)}, 400
+        return _handle_state_error(e)
+    except HTTPException:
+        raise
     except Exception as e:
         return _handle_core_exception(e)
 
@@ -212,27 +330,20 @@ def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
 
     Returns the current lifecycle status of the specified account.
     Available to any authenticated user (no admin gate).
-
-    Uses get_by_owner_id (which queries the Dataviz DB directly)
-    rather than get_account_details_by_id (which calls the external
-    account platform client and can return the caller's own data
-    regardless of the requested id).
     """
     core = get_core(current_app)
 
     try:
         accounts_service = _get_accounts_service(core)
-
         target_account_id = _get_target_account_id(kwargs)
 
-        # Look up the account by owner_account_id directly in the
-        # Dataviz data store. Raises AccountNotFoundException if the
-        # id does not match any existing account.
         account = accounts_service.get_by_owner_id(str(target_account_id))
 
         return _account_to_response(account), 200
 
     except ValueError as e:
-        return {"error": str(e)}, 400
+        return _handle_state_error(e)
+    except HTTPException:
+        raise
     except Exception as e:
         return _handle_core_exception(e)
