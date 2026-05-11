@@ -13,27 +13,22 @@ servers:
 
 paths:
 
-  /accounts/{target_account_id}:
+  /accounts/{target_account_id}/{action}:
     patch:
       summary: Activate or deactivate an account
       description: >
-        Updates the target account to the desired status and cascades
-        the change to all associated workspaces.
+        Updates the target account status and cascades the change to
+        all associated workspaces.
 
-        Set status to INACTIVE to deactivate the account and all its workspaces.
-        Set status to ACTIVE to reactivate the account and all its workspaces.
+        Select activate to reactivate the account and all its workspaces.
+        Select deactivate to deactivate the account and all its workspaces.
 
         Caller must be one of the configured admin accounts.
       operationId: account_update_status
       x-openapi-router-controller: dataviz_api.apis.v1.accounts_controller
       parameters:
         - $ref: "#/components/parameters/targetAccountId"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/AccountStatusUpdateRequest"
+        - $ref: "#/components/parameters/action"
       responses:
         "202":
           description: Account status update requested
@@ -42,7 +37,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Account"
         "400":
-          description: Invalid request body or UUID
+          description: Invalid request
           content:
             application/json:
               schema:
@@ -77,6 +72,7 @@ paths:
       tags:
         - accounts
 
+  /accounts/{target_account_id}:
     delete:
       summary: Request deletion of an account
       description: >
@@ -174,6 +170,21 @@ components:
         format: uuid
       example: 00000000-1111-2222-3333-444444444444
 
+    action:
+      name: action
+      in: path
+      required: true
+      description: >
+        The action to perform on the account.
+        activate — reactivates the account and all its workspaces.
+        deactivate — deactivates the account and all its workspaces.
+      schema:
+        type: string
+        enum:
+          - activate
+          - deactivate
+      example: deactivate
+
   securitySchemes:
     oauth2_accessCode:
       type: oauth2
@@ -189,25 +200,6 @@ components:
             dataviz:read_resources: Grant read access to resource types
 
   schemas:
-
-    AccountStatusUpdateRequest:
-      type: object
-      required:
-        - status
-      description: >
-        Request body for updating account status.
-        Use INACTIVE to deactivate, ACTIVE to reactivate.
-      properties:
-        status:
-          type: string
-          enum:
-            - ACTIVE
-            - INACTIVE
-          description: >
-            The desired status for the account.
-            ACTIVE reactivates the account and all its workspaces.
-            INACTIVE deactivates the account and all its workspaces.
-          example: INACTIVE
 
     Account:
       type: object
@@ -227,7 +219,7 @@ components:
           description: Owner account identifier
         status:
           type: string
-          description: Account status after the operation was requested
+          description: Account status after the operation
           example: INACTIVE
         name:
           type: string

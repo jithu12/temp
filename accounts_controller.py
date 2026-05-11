@@ -25,8 +25,7 @@ ALLOWED_ACCOUNT_IDS = {
     UUID(_ADMIN_ACCOUNT_2),
 }
 
-# Valid status transitions via the PATCH endpoint
-ALLOWED_STATUS_TRANSITIONS = {"ACTIVE", "INACTIVE"}
+ALLOWED_ACTIONS = {"activate", "deactivate"}
 
 
 # --------------------------------------------------------------------------
@@ -65,9 +64,7 @@ def _parse_uuid(value: Any, field_name: str) -> UUID:
 def _get_target_account_id(kwargs: Dict[str, Any]) -> UUID:
     raw = kwargs.get("target_account_id")
     if raw is None:
-        raise ValueError(
-            "Missing required path parameter 'target_account_id'."
-        )
+        raise ValueError("Missing required path parameter 'target_account_id'.")
     return _parse_uuid(raw, "target_account_id")
 
 
@@ -232,14 +229,11 @@ def _handle_state_error(e: ValueError) -> Tuple[Dict[str, Any], int]:
 # --------------------------------------------------------------------------
 def account_update_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     """
-    PATCH /admin/v1/accounts/{target_account_id}
+    PATCH /admin/v1/accounts/{target_account_id}/{action}
 
-    Updates account status to ACTIVE or INACTIVE.
-    Cascades the change to all associated workspaces.
-
-    Request body:
-        { "status": "INACTIVE" } -> deactivates the account and all workspaces
-        { "status": "ACTIVE" }   -> reactivates the account and all workspaces
+    Action dropdown (Swagger renders enum path param as dropdown):
+        activate   — reactivates the account and all its workspaces
+        deactivate — deactivates the account and all its workspaces
     """
     core = get_core(current_app)
 
@@ -250,30 +244,29 @@ def account_update_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
         target_owner_account_id = _get_target_account_id(kwargs)
         caller_account_id = _get_caller_account_id(kwargs)
 
-        # Get desired status from request body
-        body = kwargs.get("body") or {}
-        desired_status = body.get("status", "").upper()
+        # Get action from path parameter
+        action = kwargs.get("action", "").lower()
 
-        if desired_status not in ALLOWED_STATUS_TRANSITIONS:
+        if action not in ALLOWED_ACTIONS:
             return {
                 "error": (
-                    f"Invalid status '{desired_status}'. "
-                    f"Must be one of: {', '.join(sorted(ALLOWED_STATUS_TRANSITIONS))}"
+                    f"Invalid action '{action}'. "
+                    f"Must be one of: {', '.join(sorted(ALLOWED_ACTIONS))}"
                 ),
-                "code": "INVALID_STATUS",
+                "code": "INVALID_ACTION",
             }, 400
 
         # Pre-flight check
         account = _check_account_exists(accounts_service, target_owner_account_id)
 
-        if desired_status == "INACTIVE":
+        if action == "deactivate":
             _assert_account_is_active(account, target_owner_account_id)
             account = accounts_service.request_account_deactivation(
                 owner_account_id=target_owner_account_id,
                 account_id=caller_account_id,
             )
 
-        elif desired_status == "ACTIVE":
+        elif action == "activate":
             _assert_account_is_inactive(account, target_owner_account_id)
             account = accounts_service.request_account_reactivation(
                 owner_account_id=target_owner_account_id,
@@ -294,8 +287,8 @@ def account_delete(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     """
     DELETE /admin/v1/accounts/{target_account_id}
 
-    Deletes the target account and all its associated workspaces.
-    Soft delete — records remain in DB with status DELETED.
+    Soft deletes the target account and all its associated workspaces.
+    Records remain in DB with status DELETED.
     """
     core = get_core(current_app)
 
