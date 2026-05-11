@@ -321,7 +321,8 @@ def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
     """
     GET /admin/v1/accounts/{target_account_id}/status
 
-    Returns the current lifecycle status of the specified account.
+    Returns the current lifecycle status of the specified account
+    along with workspace count and details.
     Available to any authenticated user (no admin gate).
     """
     core = get_core(current_app)
@@ -330,9 +331,45 @@ def account_status(**kwargs: Any) -> Tuple[Dict[str, Any], int]:
         accounts_service = _get_accounts_service(core)
         target_account_id = _get_target_account_id(kwargs)
 
+        # Get account details
         account = accounts_service.get_by_owner_id(str(target_account_id))
+        response = _account_to_response(account)
 
-        return _account_to_response(account), 200
+        # Get workspace details for this account
+        try:
+            workspace_service = getattr(core, "workspace", None)
+            if workspace_service is not None:
+                from dataviz_core.services.filtering import FilteringCriterion
+                filters = [
+                    FilteringCriterion(
+                        "owner_account_id", str(target_account_id)
+                    )
+                ]
+                workspaces = workspace_service.repositories.workspace.list(
+                    filters=filters
+                )
+                response["workspace_count"] = len(workspaces)
+                response["workspaces"] = [
+                    {
+                        "id": str(getattr(ws, "id", "")),
+                        "name": str(getattr(ws, "name", "")),
+                        "status": (
+                            str(ws.status.value)
+                            if hasattr(ws.status, "value")
+                            else str(getattr(ws, "status", ""))
+                        ),
+                    }
+                    for ws in workspaces
+                ]
+            else:
+                response["workspace_count"] = 0
+                response["workspaces"] = []
+        except Exception:
+            # Workspace fetch is best-effort — don't fail the whole request
+            response["workspace_count"] = 0
+            response["workspaces"] = []
+
+        return response, 200
 
     except ValueError as e:
         return _handle_state_error(e)

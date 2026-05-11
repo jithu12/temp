@@ -227,7 +227,7 @@ components:
 
     AccountStatus:
       type: object
-      description: Current status of the account
+      description: Current status of the account including workspace details
       required:
         - id
         - status
@@ -235,14 +235,39 @@ components:
         id:
           type: string
           format: uuid
+          description: Account identifier
         owner_account_id:
           type: string
           format: uuid
+          description: Owner account identifier
         status:
           type: string
+          description: Current account status
           example: ACTIVE
         name:
           type: string
+          description: Account name
+        workspace_count:
+          type: integer
+          description: Total number of workspaces under this account
+          example: 3
+        workspaces:
+          type: array
+          description: List of workspaces under this account
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+                description: Workspace identifier
+              name:
+                type: string
+                description: Workspace name
+              status:
+                type: string
+                description: Current workspace status
+                example: ACTIVE
 
     ErrorModel:
       type: object
