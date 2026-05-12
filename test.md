@@ -1,45 +1,48 @@
-This is the Grafana admin password reset issue — the reset-admin pod that’s failing with 409. Even though we said we’d ignore it, this is actually the root cause of why you can’t login.
-Here’s what’s happening:
-The flow for Grafana login
+Yes absolutely possible! During **deactivation** and **reactivation** we only need to remove/recreate the Grafana deployment, ingress, services etc. The reset-admin pod is only needed during **initial stack creation** — not during deactivate/reactivate cycles.
 
-Stack creation
-    → creates deployment (Grafana pod)
-    → creates reset-admin pod
-    → reset-admin pod runs: grafana-cli admin reset-admin-password <password-from-vault>
-    → pod exits
-    → you login with that vault password
+## What should happen during deactivate
 
+Remove everything EXCEPT the reset-admin pod:
+- ✅ Delete ingress
+- ✅ Delete deployment
+- ✅ Delete HPA
+- ✅ Delete service
+- ✅ Delete configs
+- ❌ Do NOT touch reset-admin pod
 
-Why login is failing
-The reset-admin pod is failing with 409 on retries — meaning the password reset never actually completes successfully. So Grafana has either:
-	•	The old default password (admin/admin)
-	•	The previous vault password from before deactivation/reactivation
-Quick things to try right now
-Try 1 — Default Grafana credentials:
+## What should happen during reactivate
 
-username: admin
-password: admin
+Recreate everything EXCEPT the reset-admin pod:
+- ✅ Create ingress
+- ✅ Create deployment
+- ✅ Create HPA
+- ✅ Create service
+- ✅ Create configs
+- ❌ Do NOT create/touch reset-admin pod
 
+## Where to make the change
 
-Try 2 — Check what password is in vault for this workspace:
+This is in `_deactivate_workspace` and `_activate_workspace` in `workspace.py` — NOT in `kube.py`. So we're not touching kube code.
 
-grep -rn "reset_admin\|reset-admin\|grafana.*password\|vault.*grafana" dataviz_core/services/kube.py | head -10
+First let me see what `request_stack_deletion` deletes and what `_create_stack` creates. Show me:
 
+```bash
+grep -n "reset_admin\|reset-admin" dataviz_core/services/kube.py
+```
 
-Try 3 — Check if the reset-admin pod actually completed:
-Ask Sakshi to run:
+And:
+```bash
+grep -n "reset_admin\|reset-admin" dataviz_core/services/workspace.py
+```
 
-# Check reset-admin pod status
-kubectl get pods -n ns-daz-471936-dev-dv-b2b94 | grep reset-admin
+Share those outputs. Based on what I see, the fix will be in one of two places:
 
-# Check pod logs to see if password reset succeeded
-kubectl logs <reset-admin-pod-name> -n ns-daz-471936-dev-dv-b2b94
+**Option A — If `request_stack_deletion` deletes the reset-admin pod:**
 
+We need to tell it to skip that pod. But this is in `kube.py` which your Lead said not to touch. So we'd need another way.
 
-The real fix
-Since you don’t want to touch kube code, the simplest fix is to manually trigger the password reset. Find what password is stored in vault for this workspace:
+**Option B — The reset-admin pod is NOT part of `request_stack_deletion`:**
 
-grep -rn "def _reset_grafana_admin_password\|reset_admin_password\|grafana_secret" dataviz_core/services/kube.py | head -10
+Then it's already being ignored during deactivation — and the issue is only during reactivation where `create_stack` tries to recreate it and hits 409.
 
-
-Share that and I’ll tell you exactly where to find the password and how to manually reset it so you can login today without touching any code.​​​​​​​​​​​​​​​​
+Share the grep outputs and I'll tell you exactly which case you're in and what to fix in `workspace.py` only.
