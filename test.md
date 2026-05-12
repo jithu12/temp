@@ -1,48 +1,40 @@
-Yes absolutely possible! During **deactivation** and **reactivation** we only need to remove/recreate the Grafana deployment, ingress, services etc. The reset-admin pod is only needed during **initial stack creation** — not during deactivate/reactivate cycles.
+Yes! We can handle this entirely in `workspace.py` in the `_activate_workspace` function we already wrote.
 
-## What should happen during deactivate
+The fix is simple — instead of calling `create_stack` which recreates EVERYTHING including the reset-admin pod, we call a more targeted function that only recreates the Grafana deployment/ingress/services.
 
-Remove everything EXCEPT the reset-admin pod:
-- ✅ Delete ingress
-- ✅ Delete deployment
-- ✅ Delete HPA
-- ✅ Delete service
-- ✅ Delete configs
-- ❌ Do NOT touch reset-admin pod
+But first let me check what's available:
 
-## What should happen during reactivate
+```bash
+grep -n "def request_stack\|def create_stack\|def _create_stack\|def request_namespace" dataviz_core/services/kube.py | head -20
+```
 
-Recreate everything EXCEPT the reset-admin pod:
-- ✅ Create ingress
-- ✅ Create deployment
-- ✅ Create HPA
-- ✅ Create service
-- ✅ Create configs
-- ❌ Do NOT create/touch reset-admin pod
+And:
+```bash
+grep -n "reset_admin\|reset-admin" dataviz_core/services/kube.py | head -10
+```
 
-## Where to make the change
+Share those outputs. Based on what's available I'll tell you the exact change in `workspace.py` only.
 
-This is in `_deactivate_workspace` and `_activate_workspace` in `workspace.py` — NOT in `kube.py`. So we're not touching kube code.
+But thinking about it logically — if `create_stack` internally calls `_reset_grafana_admin_password` which creates the reset-admin pod, we have two options in `workspace.py`:
 
-First let me see what `request_stack_deletion` deletes and what `_create_stack` creates. Show me:
+**Option A — Skip `create_stack` entirely and call individual kube functions:**
+
+Not possible without touching kube.py.
+
+**Option B — Add a flag to skip reset-admin:**
+
+Not possible without touching kube.py.
+
+**Option C — Delete the reset-admin pod BEFORE calling `create_stack`:**
+
+This is in `workspace.py` — no kube.py touch needed. When reactivating, delete the old reset-admin pod first so `create_stack` can recreate it cleanly without 409.
+
+But you said your Lead doesn't want to touch that pod at all during activate/deactivate...
+
+So the real question is: **does `request_stack_deletion` (called during deactivate) delete the reset-admin pod or not?**
 
 ```bash
 grep -n "reset_admin\|reset-admin" dataviz_core/services/kube.py
 ```
 
-And:
-```bash
-grep -n "reset_admin\|reset-admin" dataviz_core/services/workspace.py
-```
-
-Share those outputs. Based on what I see, the fix will be in one of two places:
-
-**Option A — If `request_stack_deletion` deletes the reset-admin pod:**
-
-We need to tell it to skip that pod. But this is in `kube.py` which your Lead said not to touch. So we'd need another way.
-
-**Option B — The reset-admin pod is NOT part of `request_stack_deletion`:**
-
-Then it's already being ignored during deactivation — and the issue is only during reactivation where `create_stack` tries to recreate it and hits 409.
-
-Share the grep outputs and I'll tell you exactly which case you're in and what to fix in `workspace.py` only.
+Share that one output — it'll tell us everything. If the reset-admin pod is NOT being deleted during deactivation, then during reactivation `create_stack` tries to create it again → 409. That's the root cause and we need to know if it's being deleted or not before deciding the fix.
