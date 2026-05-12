@@ -1,158 +1,45 @@
-I can see `DELETION_REQUESTED` and `DELETING` exist but **`DEACTIVATION_REQUESTED` and `ACTIVATION_REQUESTED` don't exist yet**. We need to add them to the enum first, then update `accounts.py`.
+This is the Grafana admin password reset issue — the reset-admin pod that’s failing with 409. Even though we said we’d ignore it, this is actually the root cause of why you can’t login.
+Here’s what’s happening:
+The flow for Grafana login
 
-## Step 1 — Add new statuses to `shared_enums.py`
+Stack creation
+    → creates deployment (Grafana pod)
+    → creates reset-admin pod
+    → reset-admin pod runs: grafana-cli admin reset-admin-password <password-from-vault>
+    → pod exits
+    → you login with that vault password
 
-Open `dataviz_core/models/shared_enums.py` and add two new values to the `Status` enum:
 
-```python
-class Status(Enum):
-    CREATION_REQUESTED = "CREATION REQUESTED"
-    CREATING = "CREATING"
-    ACTIVE = "ACTIVE"
-    INACTIVE = "INACTIVE"
-    ACTIVATION_REQUESTED = "ACTIVATION REQUESTED"      # ← ADD THIS
-    DEACTIVATION_REQUESTED = "DEACTIVATION REQUESTED"  # ← ADD THIS
-    UPDATE_REQUESTED = "UPDATE REQUESTED"
-    UPDATING = "UPDATING"
-    DELETION_REQUESTED = "DELETION REQUESTED"
-    DELETING = "DELETING"
-    DELETED = "DELETED"
-    FAILED = "FAILED"
-    RETRYING = "RETRYING"
-    DEPRECATED = "DEPRECATED"
-```
+Why login is failing
+The reset-admin pod is failing with 409 on retries — meaning the password reset never actually completes successfully. So Grafana has either:
+	•	The old default password (admin/admin)
+	•	The previous vault password from before deactivation/reactivation
+Quick things to try right now
+Try 1 — Default Grafana credentials:
 
-## Step 2 — Update `accounts.py`
+username: admin
+password: admin
 
-Now update the three request methods so they set the intermediate status instead of the final one:
 
-**`request_account_deactivation`** — change final return from `INACTIVE` to `DEACTIVATION_REQUESTED`:
+Try 2 — Check what password is in vault for this workspace:
 
-```python
-# When no workspaces — still set DEACTIVATION_REQUESTED first
-# deactivate_account async target will set INACTIVE when done
-if len(workspaces) == 0:
-    self.logger.info(
-        f"No active workspaces found for owner_account_id: {owner_account_id}"
-    )
-    return self._update_account_with_and_return(
-        account,
-        status=Status.DEACTIVATION_REQUESTED  # ← was INACTIVE
-    )
+grep -rn "reset_admin\|reset-admin\|grafana.*password\|vault.*grafana" dataviz_core/services/kube.py | head -10
 
-self.workflow_executor.async_exec_core_function(
-    service="account",
-    function="deactivate_account",
-    kwargs={"owner_account_id": owner_account_id},
-)
 
-return self._update_account_with_and_return(
-    account,
-    status=Status.DEACTIVATION_REQUESTED  # ← was INACTIVE
-)
-```
+Try 3 — Check if the reset-admin pod actually completed:
+Ask Sakshi to run:
 
-Wait — but if no workspaces exist, the async job doesn't fire. So we need to handle that case differently. If no workspaces, we can go directly to `INACTIVE` since there's nothing async to wait for:
+# Check reset-admin pod status
+kubectl get pods -n ns-daz-471936-dev-dv-b2b94 | grep reset-admin
 
-```python
-if len(workspaces) == 0:
-    # No workspaces — nothing async, go straight to INACTIVE
-    return self._update_account_with_and_return(
-        account,
-        status=Status.INACTIVE
-    )
+# Check pod logs to see if password reset succeeded
+kubectl logs <reset-admin-pod-name> -n ns-daz-471936-dev-dv-b2b94
 
-# Has workspaces — set DEACTIVATION_REQUESTED, async job will set INACTIVE
-self.workflow_executor.async_exec_core_function(
-    service="account",
-    function="deactivate_account",
-    kwargs={"owner_account_id": owner_account_id},
-)
 
-return self._update_account_with_and_return(
-    account,
-    status=Status.DEACTIVATION_REQUESTED  # ← intermediate status
-)
-```
+The real fix
+Since you don’t want to touch kube code, the simplest fix is to manually trigger the password reset. Find what password is stored in vault for this workspace:
 
-**`deactivate_account`** (async target) — set `INACTIVE` only when fully done:
+grep -rn "def _reset_grafana_admin_password\|reset_admin_password\|grafana_secret" dataviz_core/services/kube.py | head -10
 
-```python
-def deactivate_account(self, owner_account_id: uuid.UUID) -> AccountDetails:
-    account = self.get_by_owner_id(owner_account_id)
 
-    self.logger.info(
-        f"All workspaces deactivation requested for {owner_account_id}"
-    )
-
-    workspace_details = (
-        self.workspace_service.deactivate_workspaces_by_owner_account_id(
-            owner_account_id
-        )
-    )
-
-    self.logger.info(
-        f"Deactivation completed for {owner_account_id} | {workspace_details}"
-    )
-
-    # Only set INACTIVE after ALL workspaces are done
-    return self._update_account_with_and_return(
-        account,
-        status=Status.INACTIVE  # ← final status, set here not in request method
-    )
-```
-
-Same pattern for reactivation:
-
-**`request_account_reactivation`**:
-
-```python
-if len(workspaces) == 0:
-    # No workspaces — go straight to ACTIVE
-    return self._update_account_with_and_return(
-        account,
-        status=Status.ACTIVE
-    )
-
-self.workflow_executor.async_exec_core_function(
-    service="account",
-    function="reactivate_account",
-    kwargs={"owner_account_id": owner_account_id},
-)
-
-return self._update_account_with_and_return(
-    account,
-    status=Status.ACTIVATION_REQUESTED  # ← intermediate status
-)
-```
-
-**`reactivate_account`** (async target) — already sets `ACTIVE` at the end ✅
-
-**`request_account_deletion`** — your Lead said delete should go directly, so no change needed there.
-
-## Step 3 — Update the controller pre-flight checks
-
-The `_assert_account_is_active` check in the controller needs to also allow `DEACTIVATION_REQUESTED` and `ACTIVATION_REQUESTED` to pass through — otherwise if a previous request is stuck mid-way, a retry will be rejected.
-
-Actually — the checks are correct as-is. If an account is in `DEACTIVATION_REQUESTED` state, it should NOT be deactivated again. Leave the pre-flight checks unchanged.
-
-But we need to update `_assert_account_is_inactive` to accept `ACTIVATION_REQUESTED` accounts — wait no, same logic. If it's already `ACTIVATION_REQUESTED`, don't request again.
-
-## Step 4 — Update `shared_enums.py` DB migration
-
-Since we're adding new enum values, check if there's a DB migration needed:
-
-```bash
-grep -rn "INACTIVE\|ACTIVE\|Status" dataviz_core/migrations/ | head -5
-# or
-ls dataviz_core/migrations/versions/ | tail -5
-```
-
-If the `status` column in `api_account_details` is a VARCHAR (string), no migration needed — it'll just store the new string values. If it's a DB-level ENUM type, you'll need a migration to add the new values.
-
-Check:
-```bash
-grep -rn "api_account_details\|AccountDetails" dataviz_core/models/ | grep -i "status\|column" | head -10
-```
-
-Share that output and I'll tell you if a migration is needed. Then I'll generate the complete updated `accounts.py` with all these changes applied.
+Share that and I’ll tell you exactly where to find the password and how to manually reset it so you can login today without touching any code.​​​​​​​​​​​​​​​​
