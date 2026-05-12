@@ -1,40 +1,32 @@
-Yes! We can handle this entirely in `workspace.py` in the `_activate_workspace` function we already wrote.
+OK I hear you — Lead says absolutely do not touch the reset-admin pod during activate/deactivate.
 
-The fix is simple — instead of calling `create_stack` which recreates EVERYTHING including the reset-admin pod, we call a more targeted function that only recreates the Grafana deployment/ingress/services.
+So the root cause is: `create_stack` calls `_reset_grafana_admin_password` which generates a new password. We need to stop `create_stack` from doing that during reactivation.
 
-But first let me check what's available:
+Since we can't touch kube.py, the only option is to **not call `create_stack` at all for reactivation**.
 
-```bash
-grep -n "def request_stack\|def create_stack\|def _create_stack\|def request_namespace" dataviz_core/services/kube.py | head -20
-```
+Instead we need a different kube function that recreates only the Grafana resources WITHOUT the password reset.
 
-And:
-```bash
-grep -n "reset_admin\|reset-admin" dataviz_core/services/kube.py | head -10
-```
-
-Share those outputs. Based on what's available I'll tell you the exact change in `workspace.py` only.
-
-But thinking about it logically — if `create_stack` internally calls `_reset_grafana_admin_password` which creates the reset-admin pod, we have two options in `workspace.py`:
-
-**Option A — Skip `create_stack` entirely and call individual kube functions:**
-
-Not possible without touching kube.py.
-
-**Option B — Add a flag to skip reset-admin:**
-
-Not possible without touching kube.py.
-
-**Option C — Delete the reset-admin pod BEFORE calling `create_stack`:**
-
-This is in `workspace.py` — no kube.py touch needed. When reactivating, delete the old reset-admin pod first so `create_stack` can recreate it cleanly without 409.
-
-But you said your Lead doesn't want to touch that pod at all during activate/deactivate...
-
-So the real question is: **does `request_stack_deletion` (called during deactivate) delete the reset-admin pod or not?**
+Check what's available:
 
 ```bash
-grep -n "reset_admin\|reset-admin" dataviz_core/services/kube.py
+grep -n "def request_\|def _create_\|def _delete_" dataviz_core/services/kube.py | grep -v "secret\|hpa\|ingress\|config\|service\|deployment\|namespace\|metric\|fluentd\|ldap\|nginx\|tls" | head -20
 ```
 
-Share that one output — it'll tell us everything. If the reset-admin pod is NOT being deleted during deactivation, then during reactivation `create_stack` tries to create it again → 409. That's the root cause and we need to know if it's being deleted or not before deciding the fix.
+And check if there's any existing function for partial stack recreation:
+
+```bash
+grep -n "def.*stack\|def.*activate\|def.*deactivate\|def.*suspend\|def.*resume" dataviz_core/services/kube.py | head -20
+```
+
+Share those outputs. If there's no suitable function, then I need to tell you honestly — **there is no way to fix this without either:**
+
+1. Touching kube.py to add a reactivation-specific function, OR
+2. Deleting the reset-admin pod before reactivation
+
+There's no third option. The password sync issue is caused by `create_stack` generating a new password but the pod failing to run. Without touching kube.py or the reset-admin pod, we can't fix it.
+
+**This needs to be raised to your Lead directly:**
+
+> "During reactivation, `create_stack` calls `_reset_grafana_admin_password` which generates a new vault password but the reset-admin pod already exists from original creation → 409 → vault and Grafana out of sync → login fails. To fix this without touching the reset-admin pod, we need either a new kube function that skips password reset during reactivation, or we accept that reactivation will always reset the Grafana admin password. Which approach do you prefer?"
+
+That's the honest answer. What does your Lead say?
