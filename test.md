@@ -1,123 +1,26 @@
-Perfect — now I have everything I need. Here's the plan:
+Yes you are correct! All three should show FAILED if anything goes wrong. Here are all three fixes:
+Fix 1 — _deactivate_workspace
 
-Add ONE new function `reactivate_stack` to `kube.py` — identical to `_create_stack` but without `_reset_grafana_admin_password`. Then update `_activate_workspace` in `workspace.py` to call it.
-
-## Change 1 — Add to `kube.py`
-
-Find `_create_stack` in `kube.py` and add this new function RIGHT AFTER it:
-
-```python
-def reactivate_stack(
-    self,
-    stack_id: uuid.UUID,
-    temp_ns_check: bool = False,
-) -> KubeStack:
-    """
-    Recreates all Kubernetes resources for an existing stack
-    WITHOUT resetting the Grafana admin password.
-
-    Used during account reactivation to preserve the vault password
-    and avoid the reset-admin pod 409 conflict on retries.
-
-    Identical to _create_stack except _reset_grafana_admin_password
-    is deliberately skipped.
-    """
-    kube_stack = self.repositories.kube_stack.get_by_id(stack_id)
-    kube_stack = self._refresh_stack(kube_stack)
-
-    if kube_stack.status not in [
-        Status.CREATION_REQUESTED,
-        Status.CREATING,
-        Status.RETRYING,
-    ]:
-        if kube_stack.status == Status.ACTIVE:
-            self.logger.info(
-                f"{logname(kube_stack)}: Kube stack already active!"
-            )
-            return kube_stack
-        self.logger.info(
-            f"{logname(kube_stack)}: Kube Stack has status "
-            f"'{kube_stack.status}', can't reactivate!"
-        )
-        raise KubeStackCreationError(kube_stack)
-
-    self._poll_res_created(
-        self.repositories.kube_namespace, kube_stack.kube_namespace_id
-    )
-    kube_stack = self._update_stack_with_and_return(
-        kube_stack, status=Status.CREATING
-    )
-    self.logger.info(f"{logname(kube_stack)}: Start reactivation")
-
+def _deactivate_workspace(self, workspace: Workspace) -> Workspace:
+    self.logger.info(f"Deactivating {logname(workspace)}...")
     try:
-        self._wait_for_dependencies(kube_stack, temp_ns_check)
-        self._poll_res_created(
-            self.repositories.sg_connect,
-            kube_stack.workspace.sg_connect_id
+        self._kube_service.request_stack_deletion(
+            workspace.kube_stack,
         )
-        self._create_tls_secret(kube_stack)
-        self._create_nginx_conf(kube_stack, temp_ns_check)
-        self._create_grafana_secret(kube_stack)
-        self._create_ldap_conf(kube_stack)
-        self._create_fluent_config(kube_stack)
-        self._create_metrology_log_secret(kube_stack)
-        self._create_metric_fluentd_conf(kube_stack)
-        self._create_metric_secret(kube_stack)
-        self._create_metric_cert_secret(kube_stack)
-        deployment = self._create_deployment(
-            kube_stack,
-            grafana_image=kube_stack.workspace.grafana_image
-        )
-        self._create_service(kube_stack)
-        self._create_ingress(kube_stack)
-        self._create_hpa(kube_stack)
-        self._create_metric_deployment(kube_stack)
-        self._check_deployment_pods_running(deployment, kube_stack)
-
-        # NOTE: _reset_grafana_admin_password deliberately skipped
-        # Vault password is preserved from original stack creation
-        # Reset-admin pod is not touched during activate/deactivate
-
-        self.sg_connect_service.update_redirect_url(
-            kube_stack.workspace.sg_connect,
-            kube_stack.dns.fqdn
-        )
-        import time
-        time.sleep(RETRY_SLEEP)
-
     except Exception as e:
-        self.logger.exception(f"{logname(kube_stack)}: Reactivation failed")
-        self.logger.info(
-            f"{logname(kube_stack)} Celery retry process will start soon..."
+        self.logger.exception(
+            f"{logname(workspace)}: '{workspace.name}' kube deletion failed."
         )
-        kube_stack = self._update_stack_with_and_return(
-            kube_stack,
-            status=self.failed_or_retrying_status
+        return self._update_workspace_with_and_return(
+            workspace, status=Status.FAILED
         )
-        deployments = self._get_deployments(stack=kube_stack)
-        workspace_count = len(deployments)
-        self._update_namespace_with(
-            kube_stack.kube_namespace,
-            workspace_count=workspace_count
-        )
-        raise KubeStackCreationError(kube_stack.id) from e
+    return self._update_workspace_with_and_return(
+        workspace, status=Status.INACTIVE
+    )
 
-    else:
-        deployments = self._get_deployments(stack=kube_stack)
-        workspace_count = len(deployments)
-        self._update_namespace_with(
-            kube_stack.kube_namespace,
-            workspace_count=workspace_count
-        )
-        return self._update_stack_with_and_return(
-            kube_stack,
-            status=Status.ACTIVE
-        )
-```
 
-## Change 2 — Update `_activate_workspace` in `workspace.py`
+Fix 2 — _activate_workspace
 
-```python
 def _activate_workspace(self, workspace: Workspace) -> Workspace:
     self.logger.info(f"Reactivating {logname(workspace)}...")
     try:
@@ -129,17 +32,11 @@ def _activate_workspace(self, workspace: Workspace) -> Workspace:
             )
             raise WorkspaceActivationFailedError(workspace.id)
 
-        # Reset the existing stack back to CREATION_REQUESTED
-        # so the reactivate_stack async job will process it
         self._kube_service._update_stack_with(
             kube_stack,
             status=Status.CREATION_REQUESTED,
         )
 
-        # Fire reactivate_stack instead of create_stack
-        # reactivate_stack recreates all Kubernetes resources
-        # WITHOUT resetting the Grafana admin password —
-        # vault password is preserved, reset-admin pod not touched
         self._kube_service.workflow_executor.async_exec_core_function(
             service="kube",
             function="reactivate_stack",
@@ -158,43 +55,99 @@ def _activate_workspace(self, workspace: Workspace) -> Workspace:
         raise
     except Exception as e:
         self.logger.exception(
-            f"{logname(workspace)}: '{workspace.name}' kube reactivation failed. "
-            f"Error: {e}"
+            f"{logname(workspace)}: '{workspace.name}' kube reactivation failed."
+        )
+        return self._update_workspace_with_and_return(
+            workspace, status=Status.FAILED
         )
 
     return self._update_workspace_with_and_return(
-        workspace,
-        status=Status.ACTIVE,
+        workspace, status=Status.ACTIVE,
     )
-```
 
-## Summary of what changed
 
-| File | Change |
-|---|---|
-| `kube.py` | Added new `reactivate_stack` function — copy of `_create_stack` with `_reset_grafana_admin_password` removed |
-| `workspace.py` | `_activate_workspace` now calls `reactivate_stack` instead of `create_stack` |
-| Everything else | Untouched ✅ |
+Fix 3 — _delete_workspace
 
-## Why this is correct
+def _delete_workspace(self, workspace: Workspace, is_failed: bool = False) -> Workspace:
+    if not is_failed:
+        self.logger.info(f"Deleting {logname(workspace)}...")
+        workspace = self._update_workspace_with_and_return(
+            workspace,
+            status=Status.DELETING
+        )
 
-```
-Deactivate:
-  → request_stack_deletion removes ingress/deployment/service/HPA
-  → reset-admin pod stays alive ✅
-  → vault password unchanged ✅
+    try:
+        if workspace.sg_connect is not None:
+            self.sg_connect_service.remove_redirect_url(
+                workspace.sg_connect,
+                workspace.dns.fqdn
+            )
+        else:
+            self.logger.warning(
+                f"{logname(workspace)}: No sg_connect found — "
+                f"skipping redirect URL removal."
+            )
 
-Reactivate:
-  → reactivate_stack recreates ingress/deployment/service/HPA
-  → _reset_grafana_admin_password SKIPPED ✅
-  → vault password unchanged ✅
-  → reset-admin pod not touched ✅
-  → Grafana comes back with same vault password ✅
-  → LOGIN WORKS ✅
+        self._dataplane.request_component_deletion(
+            component_id=workspace.dataplane_component.id
+        )
 
-Initial workspace creation:
-  → create_stack runs as before ✅
-  → _reset_grafana_admin_password runs ✅
-  → reset-admin pod created ✅
-  → vault password set for first time ✅
-```
+        self._dataplane.vault.delete_secret(
+            secret_id=workspace.dataplane_component.vault_secret_id
+        )
+
+        if workspace.dns.certificate:
+            self._dataplane.vault.delete_secret(
+                secret_id=workspace.dns.certificate.vault_secret_id
+            )
+
+        if workspace.kube_stack.vault_secret_id:
+            self._dataplane.vault.delete_secret(
+                secret_id=workspace.kube_stack.vault_secret_id
+            )
+        else:
+            self.logger.warning(
+                "No vault_secret_id found for kube stack. Skipping secret deletion."
+            )
+
+        self._dns.request_dns_deletion(dns_id=workspace.dns_id)
+
+        self._kube_service.request_namespace_deletion(
+            namespace_id=workspace.kube_stack.kube_namespace.id,
+            stack_id=workspace.kube_stack.id,
+        )
+
+    except Exception as e:
+        self.logger.exception(
+            f"{logname(workspace)}: '{workspace.name}' deletion failed."
+        )
+        return self._update_workspace_with_and_return(
+            workspace, status=Status.FAILED
+        )
+
+    return self._update_workspace_with_and_return(
+        workspace, status=Status.DELETED
+    )
+
+
+Full status truth table after all three fixes
+
+
+
+|Operation |Success                                     |Failure                                 |
+|----------|--------------------------------------------|----------------------------------------|
+|Deactivate|workspace → `INACTIVE`, account → `INACTIVE`|workspace → `FAILED`, account → `FAILED`|
+|Activate  |workspace → `ACTIVE`, account → `ACTIVE`    |workspace → `FAILED`, account → `FAILED`|
+|Delete    |workspace → `DELETED`, account → `DELETED`  |workspace → `FAILED`, account → `FAILED`|
+
+And from FAILED — admin can always retry
+
+
+
+|Current state|Can do            |
+|-------------|------------------|
+|`FAILED`     |deactivate again ✅|
+|`FAILED`     |activate again ✅  |
+|`FAILED`     |delete ✅          |
+
+Status is now always honest. No more silent failures. 🎉​​​​​​​​​​​​​​​​
