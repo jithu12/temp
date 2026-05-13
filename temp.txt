@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Tuple, Dict, Any
 from uuid import UUID
 
@@ -12,18 +13,16 @@ from platform_api.permissions import get_current_account_id
 # --------------------------------------------------------------------------
 # Admin accounts configuration
 # --------------------------------------------------------------------------
-_ADMIN_ACCOUNT_1 = "3c24a85d-f148-485e-96a9-c21d47b42f54"
-_ADMIN_ACCOUNT_2 = "d3ac47ac-cc43-4da7-b935-d0c0b1d4c7b9"
+# ADMIN_ACCOUNTS is set in env.sh as a JSON array:
+# export ADMIN_ACCOUNTS='["uuid-1", "uuid-2"]'
+# No hardcoding here — single source of truth is env.sh
+# Same env var that Core uses for its admin gate check.
 
-os.environ.setdefault(
-    "ADMIN_ACCOUNTS",
-    f'["{_ADMIN_ACCOUNT_1}","{_ADMIN_ACCOUNT_2}"]',
-)
-
-ALLOWED_ACCOUNT_IDS = {
-    UUID(_ADMIN_ACCOUNT_1),
-    UUID(_ADMIN_ACCOUNT_2),
-}
+# ADMIN_ACCOUNTS is loaded into global environment from env.sh on startup.
+# We read it directly — no hardcoding needed.
+# env.sh format: export ADMIN_ACCOUNTS='["uuid-1", "uuid-2"]'
+_raw_admin_accounts = json.loads(os.environ.get("ADMIN_ACCOUNTS", "[]"))
+ALLOWED_ACCOUNT_IDS = {UUID(account_id.strip()) for account_id in _raw_admin_accounts}
 
 ALLOWED_ACTIONS = {"activate", "deactivate"}
 
