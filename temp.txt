@@ -8,3 +8,4 @@ Started the automated lifecycle — garbage collector service built in Core, Cel
 Where is the grace period days stored? Is it in the account table or a separate config?
 When grace period ends — should it automatically delete the workspaces too or just change the account status?
 Is there already an Event Bus service in the code we can use to send the lifecycle events?
+When the account team decides the grace period, how do they notify us — is there an API call, a config file, or do they update it directly in the DB? And where exactly should we store it — in the account details table or somewhere else?
