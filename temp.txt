@@ -1,3 +1,5 @@
 Sure! How about this:
 
 > "Built an automated system that checks deactivated accounts hourly. When the grace period ends, it automatically moves them to deleting, then deleted — including all their workspaces. Event Bus and grace period config coming after tomorrow's discussion."
+
+Started the automated lifecycle — garbage collector service built in Core, Celery beat task added to Async. Runs hourly, checks INACTIVE accounts for expired grace periods → moves to DELETING, then after 24h → DELETED with workspace cascade. Grace period uses updated_at column as timer. Event Bus integration and grace_period_days DB column pending tomorrow's discussion.
