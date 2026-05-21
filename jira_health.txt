@@ -1,1 +1,51 @@
-grep -rn "subscriber\|subscribe\|consumer\|listen\|Consumer" dataviz_core/ dataviz_async/ | grep -v __pycache__ | head -10
+You were saying earlier that we needed to create it ourselves, right? But from the way you explained it, didn’t you say we had to create a garbage collector on our side?
+
+Yes, yes, but here you said we need to write a script for the garbage collector queue mechanism, right?
+
+Not exactly by just writing a script, bro. Earlier, when we discussed it, weren’t we supposed to handle it by creating a queue instance on our side?
+
+Yes, correct. So the garbage collector itself is not something we create on our side? Is it something separate?
+
+Yes, that’s where the confusion came from — about where exactly it should be created.
+
+Man, it could’ve been as simple as putting a while loop and writing this function inside the loop. That would’ve been enough.
+
+Okay. But the intention was that we should write the code from our side. The queue instance here is code that exists on our side.
+
+No, what I’ve been telling you from the beginning is this: everything I mentioned here is actually our code. Can you reflect on that? Whatever I told you, everything visible from that VPAT/viewpoint is something we are building ourselves.
+
+Yes, I already created all that, set up the cron job and everything. But when I reached this particular part, that’s when I got confused.
+
+What exactly is the confusion? Tell me.
+
+Did they specifically mention that the cube instance exists on our side? We create the code, we set it up. That part is controlled. The cube instance on the parse region currently has database availability, the database is connected, the parse region is connected… it’s not about connecting the biased region.
+
+But there’s another slide I still couldn’t understand. “Garbage collector” is just the name given to that functionality. Did you understand that?
+
+No, I didn’t understand that.
+
+Creating the garbage collector code itself is the actual task. Do you know Vikas?
+
+Vikas from that area?
+
+Yeah, our younger cousin.
+
+Oh, that younger cousin?
+
+He’s actually older than you in experience.
+
+Weren’t you already familiar with him?
+
+(Playful/slang conversation)
+
+This is where I was trying to explain it. Right now, how is the cube data being followed or tracked? How is data being tracked using events?
+
+That’s not it. Suppose we have a salary-related issue here — like changing a salary rate. This mechanism is what handles that. If we just write a function and call it once, what happens? It will stop after execution.
+
+Will it stop?
+
+What this is, is a specific kind of process — something that keeps looping. If it’s set to true, how long will it keep looping?
+
+It keeps looping until the condition is satisfied. It can keep printing for a long time like that.
+
+Similarly… I’ll explain that after giving the answer. How long will it keep printing? What exactly is that? What are you…
