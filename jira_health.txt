@@ -48,4 +48,56 @@ What this is, is a specific kind of process — something that keeps looping. If
 
 It keeps looping until the condition is satisfied. It can keep printing for a long time like that.
 
-Similarly… I’ll explain that after giving the answer. How long will it keep printing? What exactly is that? What are you…
+--------------------------------------------------------------------------
+This order/resource was actually an old resource error earlier. That’s what was changed. It has options like inactive, active, and so on. This is what we are using for support.
+
+But that’s not my actual question. My question is: you said you wrote the cron job code to collect data from the event bus, right? Where exactly is that code?
+
+You said you wrote the cron job. So where is the cron job?
+
+This is the cron job — daily. But how exactly is this running? Explain that once.
+
+This is connected as our assignment job with Celery, right?
+
+Where? Where is the job connected to Celery? Where is Celery?
+
+Sorry… yes, Celery. So where is it?
+
+Did you write a spline/script for this Thursday schedule?
+
+Okay, tell me this — if you put this function call inside a while loop, what will happen?
+
+If you write a function inside a while loop and call that function repeatedly, what happens?
+
+It becomes a specific continuously running process. It keeps looping, right? It doesn’t stop.
+
+Will it stop?
+
+If you say `while True`, how long will it loop?
+
+As long as the condition inside the while loop is satisfied, it will continue looping.
+
+If I write `while True: print()`, how long will it keep printing?
+
+Right? That’s the whole point. Did you understand now?
+
+We are the ones building it as a process.
+
+No, when I think about all this in my head, it becomes confusing like this. I’m always worried whether what I implemented is actually correct or not. That tension is what affects us.
+
+That’s why this topic has been dragging on for so long. Every time, a different issue comes up.
+
+Whenever I log in or test something, they’ll just say, ‘we’ll do it tomorrow.’ But the actual issue is that driving/implementation itself takes time.
+
+I’ll send you a document.
+
+That document is actually what we implemented. It contains the work we did.
+
+If it clearly mentions the exact scope there, then okay.
+
+It also explains which scopes we are using, the OpenID profiles we use, and the codebase used in our implementation.
+
+I already sent you the exact line references and details about how all these components were created.
+
+If you read through that document carefully, you’ll understand how SG Connect works and what all can actually be used in it.
+
