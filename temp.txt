@@ -1,33 +1,357 @@
-“See, in this kind of scenario, the first thing that happens is that the Accounts Team, from their application side, will change the account status to **Deactivated**.
+You are helping me migrate the Dataviz /health endpoint to use the 
+official `platform_health` Python library as per the new SGCP Platform 
+Health Standard.
 
-Once they change the status to **Deactivated** on their side, the next thing that happens is part of the lifecycle flow.
+## Context & Background
 
-They will publish a lifecycle event to the Event Bus called **Resource Disabled (LifecycleEvent.ResourceDisabled)**.
-That means a `Resource Disabled` event will be pushed to the Event Bus.
+The Dataviz service is a Python/Flask application that uses:
+- Celery for async task execution
+- Redis for caching
+- Elasticsearch for logging
+- The following dependencies that need health checks:
+  - KubeCPClient (Orchestrated Containers)
+  - MyVaultClient (MyVault)
+  - PostgresClient (PCP/PostgreSQL)
+  - CeleryWorkflowExecutor (Messages/RMQ)
+  - DNSClient (DNS)
+  - PKIClient (Certificate)
 
+The codebase has THREE repos:
+- dataviz-api → API spec (api_v1.yaml) and controller 
+  (health_controller.py)
+- dataviz-core → Business logic 
+  (dataviz_core/services/health.py)
+- dataviz-async → Celery app, async tasks, and workers.
+  This is where the Celery app is defined and where the
+  platform_health Celery task registration should happen.
+  The Celery scheduler and worker are configured here.
 
-What we need to do is listen to the Event Bus and read that event. Once we receive the `Disabled` event, we should update the account status to **Deactivated** on our side as well.
+## What Has Been Done Already
 
-also during the grace period owner can also change the status to Active (LifecycleEvent.ResourceActive)
+The response format of /health has already been updated to match the 
+new Platform Health Standard. The current health.py already returns:
 
-Okay? Is this clear so far, bro?
+{
+  "comment": "All modules are healthy",
+  "description": "Health status of the Dataviz Service",
+  "modules": [
+    {
+      "description": "Core application module covering 
+                      all Dataviz dependencies",
+      "name": "dataviz:application",
+      "status": "UP"
+    }
+  ],
+  "status": "UP",
+  "time": "2026-05-07T18:19:38.080958",
+  "version": "1.0"
+}
 
-The next step is: after the Accounts Team’s grace period is over, we do not need to do anything manually. Once the grace period ends, the Accounts Team themselves will move the account to the **Deleting (LifecycleEvent.ResourceDeleting)** state.
+The existing health.py has these classes:
+- CallableLoggerResult — parses Elasticsearch hits
+- DepedencyHealthBlock — internal dependency health representation
+- ModuleHealthBlock — module health with name, description, status,
+  tags, rootcause
+- HealthStatus enum — DOWN, DEGRADED, UP with ordering
+- HealthResult — final response dataclass with comment, description,
+  modules, status, time, version fields in alphabetical order
+- HealthService — main service class with:
+  - compute_status() — sliding window algorithm using ES logs
+  - get_dependencies_statuses() — MultiSearch on Elasticsearch
+  - get_modules_blocks() — aggregates module health
+  - check_health() — serves from cache or returns default
+  - update_health_cache() — computes and stores in cache
 
-So initially the account will be in the **Deactivated** state, and later the Accounts Team will update it to the **Deleting** state.
+The existing test file (tests/services/test_health.py) has:
+- build_mocked_multisearch_client() helper
+- build_hits_from_status() helper
+- test_status_order()
+- TestHealthService class with:
+  - FakeLoggerMixin, FakeLoggedAdapter, AnotherFakeLoggedAdapter
+  - test_build_logger_search_parameters()
+  - test_get_subclasses()
+  - test_get_all_dependencies_blocks_no_logs_return_up()
+  - test_get_all_dependencies_blocks()
+  - test_get_dep_status_unique()
+  - test_compute_status()
+  - test_check_health()
+  - test_check_health_with_data()
+  - test_check_health_modules_use_new_naming()
+  - test_update_health_cache()
+  - test_get_modules_blocks_returns_new_format()
+  - test_get_modules_blocks_no_logs_returns_up()
+And these new tests for the new standard:
+  - test_module_health_block_asdict_up()
+  - test_module_health_block_asdict_with_rootcause()
+  - test_module_health_block_asdict_no_null_tags()
+  - test_module_health_block_asdict_with_tags()
+  - test_health_result_from_modules_all_up()
+  - test_health_result_from_modules_one_degraded()
+  - test_health_result_from_modules_one_down()
+  - test_health_result_from_modules_key_order()
+  - test_health_result_has_time_field()
+  - test_health_result_no_dependencies_in_response()
+  - test_build_health_comment_all_up()
+  - test_build_health_comment_degraded()
+  - test_build_health_comment_down()
 
-At that point, we will receive another event from the Event Bus called **Resource Deleting (LifecycleEvent.ResourceDeleting)**.
+## What Needs To Be Done Now
 
-Whenever we receive the `Resource Deleting` event, we should delete the account on our side as well.
+The lead has shared the official `platform_health` Python library 
+docs. We need to MIGRATE from the current custom Elasticsearch-based 
+implementation to use this library.
 
-Okay? Understood?
+### Library Overview
 
-We are not maintaining any grace period logic on our side. That responsibility belongs completely to the Accounts Team. After the grace period, they move the account to the `Deleting` state, and then the Event Bus sends us the `Resource Deleting` event. Once we receive it, we delete the resource on our side.
+Install: pip install platform_health
 
-One more thing — sometimes the Event Bus crawler or processor may miss certain events.
+The library has these main components:
 
-To handle that, we should have a daily scheduled job or periodic sync process.
+1. CHECKERS — extend platform_health.HZCheckBase to create custom
+   checkers for each dependency. Built-in checkers available:
+   - HTTPChecker
+   - RedisHealthChecker
+   - UpstreamServiceChecker
 
-That scheduled run should verify and reconcile all accounts after a certain interval and mark/update anything that was missed.
+2. HEALTH BASE — main entrypoint:
+   from platform_health import Health
+   hc = Health(
+       datastore_details={
+           "redis_host": "<redis sentinel host>",
+           "redis_port": "<redis sentinel port>",
+           "redis_password": "",
+           "sentinel_mode": True,
+           "sentinel_master_name": ""
+       }
+   )
 
-That’s all we need to handle on our side.”
+3. RUNTIME — use Celery runtime ONLY (mandatory for CCP):
+   from platform_health import Health
+   health = Health(hc)
+   app = Celery()
+   health.register_task_to_celery(app)
+
+   IMPORTANT: Do NOT use HealthExecutor — it cannot be used in CCP.
+   For CCP, declare two components in ccp_config.yaml:
+   MODULE:
+     async: "my_app.celery:app"
+     schedule: "my_app.celery:app"
+
+4. REGISTER CHECKS:
+   health.register_checks([...list of checker instances...])
+
+5. MODULES — group checkers into modules using module_name parameter
+   in each checker. Module names MUST follow format:
+   <app-name>:<module-name> e.g. "dataviz:application"
+
+6. DATASTORE — library handles Redis caching automatically.
+   Use Redis with Sentinel mode.
+
+## Specific Tasks To Do
+
+### Task 1: Create Custom Checkers (dataviz-core)
+
+Create a new file: dataviz_core/services/health_checkers.py
+
+Create one custom checker per dependency by extending HZCheckBase:
+- KubeHealthChecker for KubeCPClient
+- VaultHealthChecker for MyVaultClient
+- PostgresHealthChecker for PostgresClient
+- CeleryHealthChecker for CeleryWorkflowExecutor
+- DNSHealthChecker for DNSClient
+- PKIHealthChecker for PKIClient
+
+Each checker must:
+- Have module_name = "dataviz:application"
+- Implement the actual check logic using the existing adapter/client
+- Return OK when dependency is healthy
+- Return KO when dependency raises any exception
+- Have a meaningful name and description
+- Accept the relevant client/adapter in __init__
+- Follow frozen=True dataclass style of existing code
+- Have full type hints and docstrings
+
+### Task 2: Rewrite health.py (dataviz-core)
+
+Keep these UNCHANGED (still needed for response format):
+- APP_NAME, APP_DESCRIPTION, APP_VERSION constants
+- HealthStatus enum with ordering
+- ModuleHealthBlock dataclass with asdict() returning 
+  alphabetical keys: description, name, status
+  (tags and rootcause only included if not None)
+- HealthResult dataclass with asdict() returning 
+  alphabetical keys: comment, description, modules, 
+  status, time, version
+- HealthResult.from_modules() static method
+- _build_health_comment() helper function
+
+Remove these (replaced by platform_health library):
+- CallableLoggerResult class
+- compute_status() sliding window method
+- get_dependencies_statuses() Elasticsearch MultiSearch
+- build_logger_search() DSL search builder
+- get_all_dependencies_blocks() method
+
+Rewrite HealthService to:
+- Accept redis config and checker instances in __init__
+- Initialize platform_health Health instance with 
+  Redis Sentinel datastore
+- Register all 6 custom checkers via register_checks()
+- check_health() should:
+  - Read final status from platform_health library
+  - Convert platform_health output to our HealthResult format
+  - Return HealthResult.asdict()
+- update_health_cache() should trigger platform_health 
+  health computation and store result
+- Keep backward compatibility where possible
+- Full type hints and docstrings on everything
+
+### Task 3: Update dataviz-async for Celery (dataviz-async)
+
+This must be done in dataviz-async repo, NOT in dataviz-core.
+
+- Find the existing Celery app definition file
+- Import the platform_health Health instance
+- Call health.register_task_to_celery(app) where app is 
+  the existing Celery app
+- Make sure the beat scheduler picks up the new 
+  platform_health periodic task
+- Update ccp_config.yaml to declare both:
+  - python-celery-scheduler buildpack (for scheduler)
+  - python-celery-worker buildpack (for worker)
+  - Both using the same Celery app:
+    MODULE:
+      async: "dataviz_async.celery:app"
+      schedule: "dataviz_async.celery:app"
+- Add tests for the Celery task registration
+
+### Task 4: Update Tests (dataviz-core)
+
+Keep these tests COMPLETELY UNCHANGED:
+- test_status_order
+- test_module_health_block_asdict_up
+- test_module_health_block_asdict_with_rootcause
+- test_module_health_block_asdict_no_null_tags
+- test_module_health_block_asdict_with_tags
+- test_health_result_from_modules_all_up
+- test_health_result_from_modules_one_degraded
+- test_health_result_from_modules_one_down
+- test_health_result_from_modules_key_order
+- test_health_result_has_time_field
+- test_health_result_no_dependencies_in_response
+- test_build_health_comment_all_up
+- test_build_health_comment_degraded
+- test_build_health_comment_down
+- test_check_health_modules_use_new_naming
+- test_check_health (cached result test)
+- test_check_health_with_data (new standard fields test)
+- test_update_health_cache
+
+Remove these (Elasticsearch based, no longer relevant):
+- build_mocked_multisearch_client helper
+- build_hits_from_status helper
+- test_build_logger_search_parameters
+- test_get_all_dependencies_blocks_no_logs_return_up
+- test_get_all_dependencies_blocks
+- test_get_dep_status_unique
+- test_compute_status
+- test_get_modules_blocks_returns_new_format
+- test_get_modules_blocks_no_logs_returns_up
+
+Add new tests in tests/services/test_health_checkers.py:
+- test_kube_checker_returns_ok_when_healthy
+- test_kube_checker_returns_ko_when_exception
+- test_vault_checker_returns_ok_when_healthy
+- test_vault_checker_returns_ko_when_exception
+- test_postgres_checker_returns_ok_when_healthy
+- test_postgres_checker_returns_ko_when_exception
+- test_celery_checker_returns_ok_when_healthy
+- test_celery_checker_returns_ko_when_exception
+- test_dns_checker_returns_ok_when_healthy
+- test_dns_checker_returns_ko_when_exception
+- test_pki_checker_returns_ok_when_healthy
+- test_pki_checker_returns_ko_when_exception
+- test_all_checkers_have_correct_module_name
+- test_all_checkers_have_dataviz_application_module
+
+## Important Constraints
+
+1. /health response format MUST stay exactly:
+   {
+     "comment": "...",
+     "description": "Health status of the Dataviz Service",
+     "modules": [
+       {
+         "description": "...",
+         "name": "dataviz:application",
+         "status": "UP/DEGRADED/DOWN"
+       }
+     ],
+     "status": "UP/DEGRADED/DOWN",
+     "time": "ISO format timestamp",
+     "version": "1.0"
+   }
+
+2. All response keys MUST be in alphabetical order.
+
+3. Module naming MUST follow dataviz:<module-name> format.
+
+4. Use Celery runtime ONLY — HealthExecutor is forbidden in CCP.
+
+5. Redis with Sentinel mode for datastore.
+
+6. tags and rootcause in ModuleHealthBlock only included 
+   in response when they are not None.
+
+7. DepedencyHealthBlock kept for internal use only, 
+   NEVER in /health response.
+
+8. Follow existing code style:
+   - Python 3.11
+   - from __future__ import annotations at top
+   - @dataclass(frozen=True) for data classes
+   - TYPE_CHECKING block for type-only imports
+   - Full type hints on all methods
+   - Docstrings on all classes and methods
+   - pytest with @pytest.mark.unit and 
+     @pytest.mark.component markers
+   - MockerFixture from pytest_mock for mocking
+
+9. api_v1.yaml and health_controller.py do NOT need 
+   any changes — they are already correct.
+
+## File Structure
+
+dataviz-core/
+  dataviz_core/
+    services/
+      health.py           ← REWRITE using platform_health
+      health_checkers.py  ← NEW FILE with 6 custom checkers
+  tests/
+    services/
+      test_health.py      ← UPDATE (keep/remove as above)
+      test_health_checkers.py ← NEW TEST FILE
+
+dataviz-api/
+  specifications/
+    api_v1.yaml           ← NO CHANGES NEEDED
+  apis/v1/
+    health_controller.py  ← NO CHANGES NEEDED
+
+dataviz-async/
+  [celery app file]       ← Register platform_health task
+  ccp_config.yaml         ← Add scheduler + worker config
+  tests/                  ← Add celery registration tests
+
+## Please Generate
+
+1. dataviz_core/services/health_checkers.py — full file
+2. dataviz_core/services/health.py — rewritten file
+3. tests/services/test_health.py — updated test file
+4. tests/services/test_health_checkers.py — new test file
+5. dataviz-async changes — celery registration code and 
+   ccp_config.yaml update
+
+Make sure all generated code is production ready, well 
+documented, follows all constraints above, and is 
+consistent across all three repos.
