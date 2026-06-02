@@ -1,103 +1,29 @@
-You were saying earlier that we needed to create it ourselves, right? But from the way you explained it, didn’t you say we had to create a garbage collector on our side?
+Dear Sami, Bahia, and Jeremy,
 
-Yes, yes, but here you said we need to write a script for the garbage collector queue mechanism, right?
+I would like to request additional GitHub Copilot AI Credits to support my current workload.
 
-Not exactly by just writing a script, bro. Earlier, when we discussed it, weren’t we supposed to handle it by creating a queue instance on our side?
+Since the introduction of the AI Credits (AIC) model on June 1, 2026, I have exhausted my monthly allocation while performing my regular day-to-day activities. Prior to this change, I relied heavily on Copilot as part of my normal workflow without encountering usage limitations.
 
-Yes, correct. So the garbage collector itself is not something we create on our side? Is it something separate?
+GitHub Copilot has become a key productivity tool in my daily work and is regularly used for:
 
-Yes, that’s where the confusion came from — about where exactly it should be created.
+* Code reviews and analysis
+* Bug investigation and resolution
+* Development and scripting activities
+* Troubleshooting technical issues
+* Automation-related tasks
+* Technical documentation and knowledge gathering
+* Understanding unfamiliar codebases and accelerating implementation work
 
-Man, it could’ve been as simple as putting a while loop and writing this function inside the loop. That would’ve been enough.
+The tool significantly reduces the time required to analyze issues, validate approaches, generate code suggestions, and troubleshoot problems. It also helps improve overall efficiency and allows me to focus more time on delivering solutions rather than spending time on repetitive research and implementation tasks.
 
-Okay. But the intention was that we should write the code from our side. The queue instance here is code that exists on our side.
+I am currently involved in ongoing development and support activities that require frequent interaction with Copilot. Since exhausting my allocated credits, I have experienced a noticeable impact on productivity, particularly when performing code reviews, debugging, and implementation-related work where Copilot has become an integral part of the workflow.
 
-No, what I’ve been telling you from the beginning is this: everything I mentioned here is actually our code. Can you reflect on that? Whatever I told you, everything visible from that VPAT/viewpoint is something we are building ourselves.
+Given the business value, productivity gains, and the nature of my current responsibilities, I would like to request approval for additional AI Credits beyond the standard allocation so that I can continue leveraging Copilot effectively to support ongoing deliverables and maintain delivery efficiency.
 
-Yes, I already created all that, set up the cron job and everything. But when I reached this particular part, that’s when I got confused.
+Thank you for your time and consideration. Please let me know if any further information is required.
 
-What exactly is the confusion? Tell me.
+Kind regards,
 
-Did they specifically mention that the cube instance exists on our side? We create the code, we set it up. That part is controlled. The cube instance on the parse region currently has database availability, the database is connected, the parse region is connected… it’s not about connecting the biased region.
-
-But there’s another slide I still couldn’t understand. “Garbage collector” is just the name given to that functionality. Did you understand that?
-
-No, I didn’t understand that.
-
-Creating the garbage collector code itself is the actual task. Do you know Vikas?
-
-Vikas from that area?
-
-Yeah, our younger cousin.
-
-Oh, that younger cousin?
-
-He’s actually older than you in experience.
-
-Weren’t you already familiar with him?
-
-(Playful/slang conversation)
-
-This is where I was trying to explain it. Right now, how is the cube data being followed or tracked? How is data being tracked using events?
-
-That’s not it. Suppose we have a salary-related issue here — like changing a salary rate. This mechanism is what handles that. If we just write a function and call it once, what happens? It will stop after execution.
-
-Will it stop?
-
-What this is, is a specific kind of process — something that keeps looping. If it’s set to true, how long will it keep looping?
-
-It keeps looping until the condition is satisfied. It can keep printing for a long time like that.
-
---------------------------------------------------------------------------
-This order/resource was actually an old resource error earlier. That’s what was changed. It has options like inactive, active, and so on. This is what we are using for support.
-
-But that’s not my actual question. My question is: you said you wrote the cron job code to collect data from the event bus, right? Where exactly is that code?
-
-You said you wrote the cron job. So where is the cron job?
-
-This is the cron job — daily. But how exactly is this running? Explain that once.
-
-This is connected as our assignment job with Celery, right?
-
-Where? Where is the job connected to Celery? Where is Celery?
-
-Sorry… yes, Celery. So where is it?
-
-Did you write a spline/script for this Thursday schedule?
-
-Okay, tell me this — if you put this function call inside a while loop, what will happen?
-
-If you write a function inside a while loop and call that function repeatedly, what happens?
-
-It becomes a specific continuously running process. It keeps looping, right? It doesn’t stop.
-
-Will it stop?
-
-If you say `while True`, how long will it loop?
-
-As long as the condition inside the while loop is satisfied, it will continue looping.
-
-If I write `while True: print()`, how long will it keep printing?
-
-Right? That’s the whole point. Did you understand now?
-
-We are the ones building it as a process.
-
-No, when I think about all this in my head, it becomes confusing like this. I’m always worried whether what I implemented is actually correct or not. That tension is what affects us.
-
-That’s why this topic has been dragging on for so long. Every time, a different issue comes up.
-
-Whenever I log in or test something, they’ll just say, ‘we’ll do it tomorrow.’ But the actual issue is that driving/implementation itself takes time.
-
-I’ll send you a document.
-
-That document is actually what we implemented. It contains the work we did.
-
-If it clearly mentions the exact scope there, then okay.
-
-It also explains which scopes we are using, the OpenID profiles we use, and the codebase used in our implementation.
-
-I already sent you the exact line references and details about how all these components were created.
-
-If you read through that document carefully, you’ll understand how SG Connect works and what all can actually be used in it.
-
+Jithu Paul
+Data Visualization Engineer
+Société Générale
