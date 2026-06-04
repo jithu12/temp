@@ -1,94 +1,178 @@
-You're right bro! Let me think through this more deeply for each ticket:
+Sure bro. Here’s a detailed description you can paste directly into GitHub Copilot, VS Code AI, Claude, or any LLM to explain the expected workflow and implementation.
 
----
+⸻
 
-**OBSDATAVIZ-630 — Validate Integration With Platform API Framework**
+Account Lifecycle Resource Management Workflow
 
-This is not just running our own tests. We need to actually **prove** that our new `/health` implementation is fully compliant with the platform standard. Things we need to do:
+Overview
 
-**1. Response Format Validation**
-- Hit our `/health` endpoint and verify the JSON structure exactly matches the platform standard schema
-- Verify all required fields are present: `comment`, `description`, `modules`, `status`, `time`, `version`
-- Verify module naming is `dataviz:<module-name>` format
-- Verify no `dependencies` field in response
-- Verify status values are only `UP`, `DEGRADED`, `DOWN`
+The system manages workspace resources based on an account’s lifecycle status. There are two mechanisms that trigger the same actions:
 
-**2. Swagger/OpenAPI Validation**
-- Verify our `api_v1.yaml` schema changes are correct
-- Verify the `Health` and `HealthModule` component schemas match the platform standard exactly
-- Make sure the `/health` endpoint is properly tagged with `health`
-- Verify `x-openapi-router-controller` is correctly set
+1. Event-driven Garbage Collector
+    * Triggered immediately when lifecycle events are received.
+    * Identifies resources linked to the account in Dataviz.
+    * Executes the required action.
+2. Scheduled Cron Job
+    * Runs daily at 12:00 AM.
+    * Checks all account statuses.
+    * Performs the same actions as a fallback mechanism in case events were missed.
 
-**3. Integration Test Against Platform Health Checker**
-- The platform team has their own health checker that validates XaaS implementations
-- We need to actually run our service against their validator
-- Check the platform documentation link: `https://documentation.cloud.socgen/internal/platform_standards/rest_api/health_next.html`
-- Contact the engineering team via `go/engsupport` if needed
+⸻
 
-**4. End to End Flow Validation**
-- Verify the cache flow works: `update_health_cache()` → Redis → `check_health()` serves from cache
-- Verify when cache is empty, default UP response is returned in correct format
-- Verify when a dependency goes DOWN, the module status updates correctly
-- Verify when module is DOWN, rootcause is populated correctly
-- Verify the comment field is dynamically updated based on status
+Account Lifecycle States
 
-**5. Run All Tests**
-- Run existing test suite and make sure nothing is broken
-- Run our new 26 test functions
-- Make sure `@pytest.mark.unit` and `@pytest.mark.component` tests all pass
-- Check code coverage
+1. Disabled
 
----
+When an account status changes to Disabled:
 
-**OBSDATAVIZ-601 — Breaking Change Notification**
+Action:
 
-This is a communication and documentation task. The `/health` response format is changing, so anyone consuming it needs to know. Things we need to do:
+* Shutdown all associated workspace resources.
+* Do not delete resources.
+* Preserve data and configuration.
 
-**1. Identify Who Is Consuming Our `/health`**
-- Check if any internal teams or monitoring tools are calling `GET /health` on Dataviz
-- Check Grafana dashboards — is `/health` being monitored anywhere?
-- Check if the platform team's HZ Observer is already configured to call our `/health`
-- Check if any other XaaS teams depend on our `/health` response format
+Account Status = Disabled
+        ↓
+Shutdown Workspace
 
-**2. Document the Breaking Changes Clearly**
-- Old format had: `status`, `version`, `comment`, `dependencies`, `modules`
-- New format has: `comment`, `description`, `modules`, `status`, `time`, `version`
-- **Breaking:** `dependencies` array is removed from response
-- **Breaking:** `modules` now have `description`, `rootcause`, `tags` fields added
-- **Breaking:** module `name` now follows `dataviz:<module>` format instead of just `"application"`
-- **New:** `description` field added at top level
-- **New:** `time` timestamp field added
+⸻
 
-**3. Send Notification**
-- Write a clear notification message explaining the changes
-- Share the new response format example with affected teams
-- Give them a timeline — when will the change go live?
-- Tell them what they need to update on their side
+2. Active
 
-**4. Update Internal Documentation**
-- Update the Dataviz internal wiki/SharePoint with the new `/health` format
-- Update any Grafana dashboards or alerting rules that check `/health` response fields
-- Update the Dataviz API documentation
+When an account status changes to Active:
 
-**5. Post on JIRA VIVA ENGAGE**
-- The banner on Jira says "JIRA VIVA ENGAGE (Please subscribe)"
-- Post an announcement there about the breaking change
+Action:
 
----
+* Start or enable all associated workspace resources.
 
-**So bro, to summarize what's left:**
+Account Status = Active
+        ↓
+Turn On Workspace
 
-| Task | Ticket | Effort |
-|------|--------|--------|
-| Raise PR for health.py + tests | OBSDATAVIZ-633 | Low |
-| Raise PR for api_v1.yaml schema | OBSDATAVIZ-633 | Low |
-| Run full test suite | OBSDATAVIZ-630 | Medium |
-| Swagger validation | OBSDATAVIZ-630 | Low |
-| Platform integration test | OBSDATAVIZ-630 | Medium |
-| E2E cache flow validation | OBSDATAVIZ-630 | Medium |
-| Identify consumers of /health | OBSDATAVIZ-601 | Medium |
-| Document breaking changes | OBSDATAVIZ-601 | Low |
-| Send notifications to teams | OBSDATAVIZ-601 | Low |
-| Update internal docs/Grafana | OBSDATAVIZ-601 | Medium |
+⸻
 
-Want me to write the Jira descriptions for both tickets and also draft the breaking change notification message bro?
+3. Deleting
+
+When an account status changes to Deleting:
+
+Action:
+
+* Delete all workspace resources associated with the account.
+* Remove resources permanently.
+
+Account Status = Deleting
+        ↓
+Delete Workspace Resources
+
+⸻
+
+4. Deleted
+
+When an account status changes to Deleted:
+
+Action:
+
+* Verify whether all resources were successfully deleted.
+* If some resources could not be deleted:
+    * Send a run-update notification email to the Dataviz team.
+    * Include details of remaining resources requiring manual intervention.
+
+Account Status = Deleted
+        ↓
+Check Remaining Resources
+        ↓
+If resources still exist
+        ↓
+Send Notification Email to Dataviz Team
+
+⸻
+
+Event-Driven Garbage Collector Flow
+
+The garbage collector listens for lifecycle events:
+
+LifecycleEvent.ResourceDisabled
+LifecycleEvent.ResourceActive
+LifecycleEvent.ResourceDeleting
+LifecycleEvent.ResourceDeleted
+
+Workflow:
+
+Receive Lifecycle Event
+        ↓
+Identify resources linked to the account in Dataviz
+        ↓
+Switch based on event type
+ResourceDisabled  → Shutdown Workspace
+ResourceActive    → Turn On Workspace
+ResourceDeleting  → Delete Workspace Resources
+ResourceDeleted   → Send notification if resources remain
+
+Pseudo-code:
+
+def handle_lifecycle_event(event, account_id):
+    resources = get_account_resources(account_id)
+    if event == "ResourceDisabled":
+        shutdown_workspace(resources)
+    elif event == "ResourceActive":
+        start_workspace(resources)
+    elif event == "ResourceDeleting":
+        delete_workspace_resources(resources)
+    elif event == "ResourceDeleted":
+        remaining = find_remaining_resources(resources)
+        if remaining:
+            send_notification_email(
+                account_id,
+                remaining
+            )
+
+⸻
+
+Scheduled Cron Job Flow
+
+Schedule:
+
+Runs every day at 00:00 (12 AM)
+
+Workflow:
+
+Cron Job Starts
+        ↓
+Fetch Accounts
+        ↓
+For each account
+        ↓
+Check Account Status
+Disabled  → Shutdown Workspace
+Active    → Turn On Workspace
+Deleting  → Delete Workspace Resources
+Deleted   → Send notification if resources remain
+
+Pseudo-code:
+
+def nightly_cron_job():
+    accounts = fetch_all_accounts()
+    for account in accounts:
+        status = account.status
+        resources = get_account_resources(account.id)
+        if status == "Disabled":
+            shutdown_workspace(resources)
+        elif status == "Active":
+            start_workspace(resources)
+        elif status == "Deleting":
+            delete_workspace_resources(resources)
+        elif status == "Deleted":
+            remaining = find_remaining_resources(resources)
+            if remaining:
+                send_notification_email(
+                    account.id,
+                    remaining
+                )
+
+⸻
+
+Design Goal
+
+The Garbage Collector provides immediate action through events, while the Cron Job acts as a safety net to ensure consistency and recover from missed events, failures, or synchronization issues.
+
+This guarantees that workspace resources always match the current account lifecycle state.
