@@ -1,29 +1,16 @@
-Dear Sami, Bahia, and Jeremy,
+Search the entire repository for account_reconciliation.
+Show all references including:
+- Celery Beat schedule
+- app.conf.beat_schedule
+- celerybeat schedule
+- task registration
+- delayed task invocation
 
-I would like to request additional GitHub Copilot AI Credits to support my current workload.
+Is account_reconciliation task ever scheduled or invoked?
+Show exact file names and line numbers.
 
-Since the introduction of the AI Credits (AIC) model on June 1, 2026, I have exhausted my monthly allocation while performing my regular day-to-day activities. Prior to this change, I relied heavily on Copilot as part of my normal workflow without encountering usage limitations.
+Search where AccountReconciliationService is instantiated.
+Show where lifecycle_consumer and accounts_api_client are injected.
 
-GitHub Copilot has become a key productivity tool in my daily work and is regularly used for:
-
-* Code reviews and analysis
-* Bug investigation and resolution
-* Development and scripting activities
-* Troubleshooting technical issues
-* Automation-related tasks
-* Technical documentation and knowledge gathering
-* Understanding unfamiliar codebases and accelerating implementation work
-
-The tool significantly reduces the time required to analyze issues, validate approaches, generate code suggestions, and troubleshoot problems. It also helps improve overall efficiency and allows me to focus more time on delivering solutions rather than spending time on repetitive research and implementation tasks.
-
-I am currently involved in ongoing development and support activities that require frequent interaction with Copilot. Since exhausting my allocated credits, I have experienced a noticeable impact on productivity, particularly when performing code reviews, debugging, and implementation-related work where Copilot has become an integral part of the workflow.
-
-Given the business value, productivity gains, and the nature of my current responsibilities, I would like to request approval for additional AI Credits beyond the standard allocation so that I can continue leveraging Copilot effectively to support ongoing deliverables and maintain delivery efficiency.
-
-Thank you for your time and consideration. Please let me know if any further information is required.
-
-Kind regards,
-
-Jithu Paul
-Data Visualization Engineer
-Société Générale
+Can account_reconciliation currently perform reconciliation?
+Analyze _fetch_account_status_from_accounts_team and identify any TODOs, stubs, mocked implementations, or missing integrations.
