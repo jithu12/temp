@@ -1,219 +1,97 @@
-Sure bro. Here's a detailed description you can paste directly into GitHub Copilot, VS Code AI, Claude, or any LLM to explain the expected workflow and implementation.
+Oh sorry bro! Here are the cleaned up versions without any code:
 
 ---
 
-## Account Lifecycle Resource Management Workflow
+**OBSDATAVIZ-601 — Breaking Change Notification**
 
-### Overview
+**Description:**
+```
+The /health endpoint response format is changing as part 
+of the migration to the new SGCP Platform Health Standard.
 
-The system manages workspace resources based on an account's lifecycle status. There are **two mechanisms** that trigger the same actions:
+The following breaking changes are being introduced:
 
-1. **Event-driven Garbage Collector**
+- The "dependencies" array is removed from the response
+- Module name format changed from "application" to 
+  "dataviz:application"
+- New fields added to the response: "description", 
+  "time", "comment"
+- Each module now includes a "description" field
+- Module can now include optional "rootcause" field 
+  when status is not UP
 
-   * Triggered immediately when lifecycle events are received.
-   * Identifies resources linked to the account in Dataviz.
-   * Executes the required action.
-
-2. **Scheduled Cron Job**
-
-   * Runs daily at **12:00 AM**.
-   * Checks all account statuses.
-   * Performs the same actions as a fallback mechanism in case events were missed.
-
----
-
-## Account Lifecycle States
-
-### 1. Disabled
-
-When an account status changes to **Disabled**:
-
-**Action:**
-
-* Shutdown all associated workspace resources.
-* Do not delete resources.
-* Preserve data and configuration.
-
-```text
-Account Status = Disabled
-        ↓
-Shutdown Workspace
+Any team or tool currently consuming the Dataviz /health 
+endpoint needs to update their integration accordingly.
 ```
 
----
-
-### 2. Active
-
-When an account status changes to **Active**:
-
-**Action:**
-
-* Start or enable all associated workspace resources.
-
-```text
-Account Status = Active
-        ↓
-Turn On Workspace
+**Acceptance Criteria:**
+```
+- All consumers of the Dataviz /health endpoint 
+  are identified
+- All affected teams are notified about the 
+  breaking changes
+- Breaking changes are clearly documented and shared
+- Affected teams confirm they have updated 
+  their side
+- Internal documentation is updated with the 
+  new response format
+- Grafana dashboards or alerts using /health 
+  response fields are reviewed and updated 
+  if needed
+- Announcement posted on JIRA VIVA ENGAGE
 ```
 
 ---
 
-### 3. Deleting
+**OBSDATAVIZ-630 — Validate Integration With Platform API Framework**
 
-When an account status changes to **Deleting**:
+**Description:**
+```
+After migrating the /health endpoint to use the official 
+platform_health Python library, we need to validate that 
+the integration is working correctly end to end and fully 
+complies with the SGCP Platform Health Standard.
 
-**Action:**
+This includes validating the response format, Redis 
+caching behaviour, Celery task scheduling, and health 
+checker execution for all Dataviz dependencies.
+```
 
-* Delete all workspace resources associated with the account.
-* Remove resources permanently.
-
-```text
-Account Status = Deleting
-        ↓
-Delete Workspace Resources
+**Acceptance Criteria:**
+```
+- GET /health returns response matching the new 
+  Platform Health Standard format exactly
+- All required fields are present in the response: 
+  comment, description, modules, status, time, version
+- Module names follow the dataviz colon module-name 
+  format
+- Dependencies field is not present in the response
+- Status values are only UP, DEGRADED, or DOWN
+- All 6 dependency checkers are working correctly:
+  * KubeCPClient checker
+  * MyVaultClient checker
+  * PostgresClient checker
+  * CeleryWorkflowExecutor checker
+  * DNSClient checker
+  * PKIClient checker
+- Redis Sentinel caching is working correctly and 
+  /health is being served from cache
+- When cache is empty, a default UP response is 
+  returned in the correct format
+- Celery beat task is scheduled and running 
+  at the correct interval
+- When a dependency goes DOWN, the module status 
+  updates correctly in the response
+- When a module is DOWN, the rootcause field is 
+  populated correctly
+- All unit tests are passing
+- All component tests are passing
+- Swagger schema is validated against the 
+  actual response
+- Platform team health validator confirms 
+  compliance with the new standard
 ```
 
 ---
 
-### 4. Deleted
-
-When an account status changes to **Deleted**:
-
-**Action:**
-
-* Verify whether all resources were successfully deleted.
-* If some resources could not be deleted:
-
-  * Send a run-update notification email to the Dataviz team.
-  * Include details of remaining resources requiring manual intervention.
-
-```text
-Account Status = Deleted
-        ↓
-Check Remaining Resources
-        ↓
-If resources still exist
-        ↓
-Send Notification Email to Dataviz Team
-```
-
----
-
-## Event-Driven Garbage Collector Flow
-
-The garbage collector listens for lifecycle events:
-
-```text
-LifecycleEvent.ResourceDisabled
-LifecycleEvent.ResourceActive
-LifecycleEvent.ResourceDeleting
-LifecycleEvent.ResourceDeleted
-```
-
-Workflow:
-
-```text
-Receive Lifecycle Event
-        ↓
-Identify resources linked to the account in Dataviz
-        ↓
-Switch based on event type
-
-ResourceDisabled  → Shutdown Workspace
-ResourceActive    → Turn On Workspace
-ResourceDeleting  → Delete Workspace Resources
-ResourceDeleted   → Send notification if resources remain
-```
-
-Pseudo-code:
-
-```python
-def handle_lifecycle_event(event, account_id):
-
-    resources = get_account_resources(account_id)
-
-    if event == "ResourceDisabled":
-        shutdown_workspace(resources)
-
-    elif event == "ResourceActive":
-        start_workspace(resources)
-
-    elif event == "ResourceDeleting":
-        delete_workspace_resources(resources)
-
-    elif event == "ResourceDeleted":
-        remaining = find_remaining_resources(resources)
-
-        if remaining:
-            send_notification_email(
-                account_id,
-                remaining
-            )
-```
-
----
-
-## Scheduled Cron Job Flow
-
-Schedule:
-
-```text
-Runs every day at 00:00 (12 AM)
-```
-
-Workflow:
-
-```text
-Cron Job Starts
-        ↓
-Fetch Accounts
-        ↓
-For each account
-        ↓
-Check Account Status
-
-Disabled  → Shutdown Workspace
-Active    → Turn On Workspace
-Deleting  → Delete Workspace Resources
-Deleted   → Send notification if resources remain
-```
-
-Pseudo-code:
-
-```python
-def nightly_cron_job():
-
-    accounts = fetch_all_accounts()
-
-    for account in accounts:
-
-        status = account.status
-        resources = get_account_resources(account.id)
-
-        if status == "Disabled":
-            shutdown_workspace(resources)
-
-        elif status == "Active":
-            start_workspace(resources)
-
-        elif status == "Deleting":
-            delete_workspace_resources(resources)
-
-        elif status == "Deleted":
-
-            remaining = find_remaining_resources(resources)
-
-            if remaining:
-                send_notification_email(
-                    account.id,
-                    remaining
-                )
-```
-
----
-
-## Design Goal
-
-The **Garbage Collector** provides immediate action through events, while the **Cron Job** acts as a safety net to ensure consistency and recover from missed events, failures, or synchronization issues.
-
-This guarantees that workspace resources always match the current account lifecycle state.
+Clean and ready to paste into Jira bro! 👍
