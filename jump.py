@@ -1,583 +1,1141 @@
-#async/app.py
+#core/workspace.py
 
-import logging
+import datetime
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Sequence,
+    Union,
+)
+import json
 import os
-from typing import Any, Mapping, Optional, Sequence
-
-from dataviz_core.models.shared_enums import Status
-from celery import Celery, Task
-from celery.schedules import crontab
-from celery.signals import eventlet_pool_started, task_postrun, worker_process_init
-from sg_cacert_file import load_sg_certs
-from sg_metrology.extensions import celery as metrology
-from sg_opentracing.sg_opentracing import get_current_span
-from sg_opentracing.utils import celery_run_set_operation_name
-
-from dataviz_async import core, tracing
-from dataviz_async.core import get_core, get_provider
-
-logger = logging.getLogger(__name__)
-
-load_sg_certs()
-
-if not os.path.exists("logs"):
-    os.makedirs("logs")
-
-app = Celery(__name__, broker=None)
-app.config_from_object("dataviz_async.config")
-metrology.init_app(app)
-core.init_app(app)
-eventlet_pool_started.connect(tracing.set_opentracing)
-worker_process_init.connect(tracing.set_opentracing)
-
-# NOTE: Lifecycle consumer is now deployed as a separate standalone service
-# See dataviz_async/lifecycle_consumer_main.py and ccp_config_lifecycle.yaml
-# DO NOT auto-start the consumer in the CP worker - it blocks indefinitely
-
-
-@app.task(name="exec_core_function", bind=True, default_retry_delay=10)
-def exec_core_function(
-    self: Task,
-    service: str,
-    function: str,
-    args: Optional[Sequence[Any]] = None,
-    kwargs: Optional[Mapping[str, Any]] = None,
-    max_retries: int = 5,
-    final_status: bool = False,
-) -> Any:
-    setattr(self.request, "max_retries", max_retries)
-    span = get_current_span()
-    celery_run_set_operation_name(span, f"{service}.{function}")
-    span.set_tag("service", service)
-    span.set_tag("function", function)
-    if args is None:
-        args = []
-    if kwargs is None:
-        kwargs = {}
-    core = get_core(app)
-    serv = getattr(core, service)
-    func = getattr(serv, function)
-    try:
-        res = func(*args, **kwargs)
-    except Exception as e:
-        logger.exception(
-            (
-                f"core.{service}.{function} failed. Retry in 10 seconds.."
-                f" {getattr(self.request, 'retries', 0)}/{max_retries}"
-            ),
-            extra={
-                "error_retries": getattr(self.request, "retries", 0),
-                "error_max_retries": max_retries,
-            },
-        )
-        if getattr(self.request, "retries", 0) == max_retries and final_status:
-            logger.info(
-                f"the function {function} raised exception with kwargs: {kwargs}",
-                extra={"final_status": "FAILURE"},
-            )
-        raise self.retry(exc=e, max_retries=max_retries)
-    else:
-        if final_status:
-            if getattr(res, "status", None) in [Status.ACTIVE, Status.FAILED, Status.DELETED]:
-                result = "FAILURE" if res.status == Status.FAILED else "SUCCESS"
-                logger.info(
-                    (
-                        f"the function {service}.{function} give "
-                        f"the async status {result} with kwargs: {kwargs}"
-                    ),
-                    extra={"final_status": result},
-                )
-
-
-@task_postrun.connect(sender=exec_core_function)
-def task_postrun_close_session(**kwargs: Any) -> None:
-    logger.info("closing sqlalchemy sessions")
-    get_provider(app).close_sessions()
-
-
-@app.task(name="update_health_cache")
-def update_health_cache() -> None:
-    logger.info("updating health check cached result: BEGIN")
-    get_core(app).health.update_health_cache()
-    logger.info("updating health check cached result: DONE")
-
-
-@app.task(name="backup_status_update")
-def backup_status_update() -> None:
-    logger.info("updating backup status result: BEGIN")
-    get_core(app).backup.backup_status_update()
-    logger.info("updating backup status result: DONE")
-
-
-@app.task(name="check_certificate_expiration")
-def check_certificate_expiration() -> None:
-    logger.info("Checking expiration certificates: BEGIN")
-    get_core(app).certificate.check_certificate_expiration_and_renewal_certificate()
-    logger.info("Certificate renewal: DONE")
-
-
-@app.task(name="account_reconciliation")
-def account_reconciliation() -> None:
-    """
-    Daily reconciliation task to sync account status with Accounts Team.
-
-    Catches any Event Bus events that were missed or failed.
-    Runs daily at 12 AM UTC.
-
-    NOTE: Graceful fallback if API client not configured yet.
-    """
-    logger.info("Account reconciliation: BEGIN")
-
-    try:
-        core_instance = get_core(app)
-
-        # Check if reconciliation service is available
-        if not hasattr(core_instance, "account_reconciliation"):
-            logger.warning(
-                "Account reconciliation service not wired in core.py yet. "
-                "Skipping reconciliation."
-            )
-            return
-
-        reconciliation_service = core_instance.account_reconciliation
-
-        # Check if Accounts Team API client is configured
-        if not reconciliation_service._accounts_api_client:
-            logger.warning(
-                "Accounts Team API client not configured. "
-                "Skipping reconciliation. Configure ACCOUNTS_TEAM_API_URL to enable."
-            )
-            return
-
-        summary = reconciliation_service.run()
-
-        logger.info(
-            "Account reconciliation completed: "
-            "checked=%s updated=%s deleted=%s errors=%s",
-            summary["accounts_checked"],
-            summary["accounts_updated"],
-            summary["accounts_deleted"],
-            len(summary["errors"]),
-        )
-
-        if summary["errors"]:
-            logger.error("Reconciliation errors: %s", summary["errors"])
-
-    except Exception as e:
-        logger.error("Account reconciliation failed: %s", e, exc_info=True)
-
-    logger.info("Account reconciliation: DONE")
-
-
-LIFECYCLE_QUEUE_ALIAS = "dataviz-lifecycle-consumer"
-LIFECYCLE_TOPIC = "lifecycle"
-LIFECYCLE_ROUTING_KEYS = [
-    "LifecycleEvent.ResourceDisabled",
-    "LifecycleEvent.ResourceActive",
-    "LifecycleEvent.ResourceDeleting",
-    "LifecycleEvent.ResourceDeleted",
-]
-
-LIFECYCLE_EVENT_TYPES = set(LIFECYCLE_ROUTING_KEYS) | {
-    "ResourceDisabled",
-    "ResourceActive",
-    "ResourceDeleting",
-    "ResourceDeleted",
-}
-
-REQUIRED_CLOUDEVENT_FIELDS = (
-    "specversion",
-    "id",
-    "time",
-    "type",
-    "source",
-    "subject",
+import time
+import logging
+import uuid
+from requests.exceptions import ConnectionError
+from uuid import UUID
+from dataviz_core.adapters.workflow_executor import WorkflowExecutor
+from dataviz_core.config.const import (
+    POOLING_TIMEOUT,
+    # WORKSPACE_LIMIT_PER_ACCOUNT,
+    RETRY_SLEEP,
+    GRAFANA_CUSTOM_CONFIGURATION,
+    GRAFANA_DEFAULT_CONFIGURATION,
+    ALIAS_GRAFANA_DEFAULT_CONFIGURATION,
 )
 
-
-def _parse_eventbus_regions(configured_regions: str) -> list[str]:
-    """Parse a comma-separated region list while preserving order."""
-    regions: list[str] = []
-    for raw_region in configured_regions.split(","):
-        region = raw_region.strip()
-        if region and region not in regions:
-            regions.append(region)
-    return regions
-
-
-def _get_eventbus_regions() -> list[str]:
-    """Return the configured Event Bus regions, preferring the explicit multi-region env var."""
-    configured_regions = os.environ.get("EVENTBUS_REGIONS", "")
-    if configured_regions:
-        return _parse_eventbus_regions(configured_regions)
-
-    return _parse_eventbus_regions(os.environ.get("REGION", ""))
-
-
-def _validate_eventbus_credentials(username: str, password: str, regions: list[str]) -> None:
-    """Validate Event Bus credentials and raise ValueError if missing."""
-    if not username or not password:
-        logger.error(
-            "EVENTBUS_USERNAME/EVENTBUS_PASSWORD not set! Cannot start lifecycle consumer."
-        )
-        raise ValueError("EVENTBUS_USERNAME and EVENTBUS_PASSWORD required")
-
-    if not regions:
-        logger.error("EVENTBUS_REGIONS/REGION not set! Cannot start lifecycle consumer.")
-        raise ValueError("EVENTBUS_REGIONS or REGION required")
-
-
-def _create_lifecycle_consumers(
-    lifecycle_service,
-    eventbus_username: str,
-    eventbus_password: str,
-    regions: list[str],
-    *,
-    client_class,
-    queue_class,
-    consumer_class,
-):
-    """Create one lifecycle consumer per configured Event Bus region."""
-    on_lifecycle_event = _create_lifecycle_event_handler(lifecycle_service)
-    on_dead_letter = _create_dead_letter_handler()
-
-    consumers = []
-    for region in regions:
-        eventbus_client = client_class(
-            user=eventbus_username,
-            password=eventbus_password,
-            region=region,
-        )
-
-        queue = queue_class(
-            client=eventbus_client,
-            alias=LIFECYCLE_QUEUE_ALIAS,
-            topic=LIFECYCLE_TOPIC,
-            routing_key=LIFECYCLE_ROUTING_KEYS,
-        )
-
-        logger.info("Queue created: %s on topic '%s' (region: %s)", queue, LIFECYCLE_TOPIC, region)
-
-        consumers.append(
-            consumer_class(
-                queue=queue,
-                callback=on_lifecycle_event,
-                dead_letter=on_dead_letter,
-                auto_ack=True,
-                timeout=10,
-            )
-        )
-
-    return consumers
-
-
-def _extract_event_fields(event) -> tuple[str, dict]:
-    """
-    Extract event type and inner data payload from a CloudEvent object or dict.
-
-    Always returns (str, dict) — never (None, None) — so callers can safely
-    call .get() on the data without guarding against None.
-    """
-    if isinstance(event, dict):
-        event_type = event.get("type") or ""
-        event_data = event.get("data") or {}
-    else:
-        event_type = getattr(event, "type", None) or ""
-        event_data = getattr(event, "data", None) or {}
-
-    if not isinstance(event_data, dict):
-        logger.warning(
-            "CloudEvent 'data' field is not a dict (got %s) — using empty dict.",
-            type(event_data).__name__,
-        )
-        event_data = {}
-
-    return event_type, event_data
-
-
-def _get_event_attr(event, key: str):
-    """Best-effort CloudEvent attribute extraction across dict/object and key casing."""
-    key_lower = key.lower()
-
-    if isinstance(event, dict):
-        if key in event:
-            return event[key]
-        if key_lower in event:
-            return event[key_lower]
-        for k, value in event.items():
-            if isinstance(k, str) and k.lower() == key_lower:
-                return value
-        return None
-
-    value = getattr(event, key, None)
-    if value is not None:
-        return value
-
-    value = getattr(event, key_lower, None)
-    if value is not None:
-        return value
-
-    extensions = getattr(event, "extensions", None)
-    if isinstance(extensions, dict):
-        if key in extensions:
-            return extensions[key]
-        if key_lower in extensions:
-            return extensions[key_lower]
-        for k, ext_value in extensions.items():
-            if isinstance(k, str) and k.lower() == key_lower:
-                return ext_value
-
-    return None
-
-
-def _validate_lifecycle_event(event, event_type: str, event_data: dict) -> tuple[bool, str]:
-    """Validate mandatory lifecycle CloudEvent envelope fields before processing."""
-    missing_fields = [field for field in REQUIRED_CLOUDEVENT_FIELDS if not _get_event_attr(event, field)]
-    if missing_fields:
-        return False, f"missing required CloudEvent fields: {', '.join(missing_fields)}"
-
-    specversion = str(_get_event_attr(event, "specversion") or "").strip()
-    # Accept both "1.0" (canonical) and "1.0.0" (common non-canonical variant)
-    # on inbound events to be tolerant of minor sender differences.
-    if specversion not in ("1.0", "1.0.0"):
-        return False, f"unsupported CloudEvent specversion '{specversion}'"
-
-    if event_type not in LIFECYCLE_EVENT_TYPES:
-        return False, f"unsupported lifecycle event type '{event_type}'"
-
-    datacontenttype = str(_get_event_attr(event, "datacontenttype") or "").strip().lower()
-    if datacontenttype and datacontenttype != "application/hal+json":
-        logger.warning(
-            "Lifecycle event has unexpected datacontenttype '%s' (expected application/hal+json)",
-            datacontenttype,
-        )
-
-    if "resource" not in event_data:
-        logger.warning("Lifecycle event payload missing data.resource")
-
-    return True, ""
-
-
-def _extract_account_id(event, event_data: dict) -> Optional[str]:
-    """
-    Extract the account ID from the full CloudEvent.
-
-    Resolution order:
-      1. 'subject'        — top-level CloudEvent attribute (most reliable)
-      2. 'resourceOwner'  — top-level CloudEvent extension attribute
-      3. data.account_id  — inner data payload
-      4. data.resource_id — inner data payload fallback
-
-    IMPORTANT: this function must receive the FULL event (object or dict),
-    not just event["data"]. 'subject' and 'resourceOwner' are top-level
-    CloudEvent attributes and will be missed if only the data payload is passed.
-    """
-    subject = _get_event_attr(event, "subject")
-    resource_owner = _get_event_attr(event, "resourceOwner")
-
-    resource = event_data.get("resource") if isinstance(event_data, dict) else None
-    if not isinstance(resource, dict):
-        resource = {}
-
-    return (
-        subject
-        or resource_owner
-        or event_data.get("account_id")
-        or event_data.get("resource_id")
-        or resource.get("owner_account_id")
-        or resource.get("ownerAccountId")
-        or resource.get("account_id")
+# Parse admin accounts as a set for O(1) exact-match membership checks.
+_raw_admin_accounts_ws = os.environ.get("ADMIN_ACCOUNTS", "[]")
+try:
+    _ADMIN_ACCOUNT_IDS_WS: set = set(json.loads(_raw_admin_accounts_ws))
+except (json.JSONDecodeError, TypeError, ValueError):
+    logging.getLogger(__name__).error(
+        "workspace.py: Failed to parse ADMIN_ACCOUNTS env variable — defaulting to empty set."
     )
+    _ADMIN_ACCOUNT_IDS_WS: set = set()
+from dataviz_core.utils import logname, update_resource_with, _inject_owner_in_filters
+from dataviz_core.utils.polling import poll_resource_status
+from dataviz_core.models import Status
+from dataviz_core.models.utils import format_date
+
+from dataviz_core.services.session import SessionManagerMixin
+from dataviz_core.services.filtering import FilteringCriterion
+
+from dataviz_core.errors.exceptions import (
+    WorkspaceLimitReachedError,
+    WorkspaceCreationFailedError,
+    WorkspaceDeletionFailedError,
+    GenericInputError,
+    NotOwnerError,
+    WorkspaceAlreadyUsedError,
+    NotFoundError,
+    WorkspaceNotFoundError,
+    BackupNotFoundError,
+    WorkspaceStatusNotActiveError,
+    GrafanaCustomConfigurationInputError,
+    WorkspaceActivationFailedError,
+    WorkspaceDeActivationFailedError,
+)
+from dataviz_core.models.restore import RestoreWorkspace
+
+from dataviz_core.models.workspace import Workspace
+from dataviz_core.utils.logging import get_default_logger
+
+if TYPE_CHECKING:  # pragma: no cover:
+    from dataviz_core.repositories.context import RepositoryContext
+    from dataviz_core.repositories.base import RepositoryBase
+    from dataviz_core.services.interfaces import SessionProvider
+    from dataviz_core.services.dataplane import DataplaneService
+    from dataviz_core.services.dns import DNSService
+    from dataviz_core.services.kube import KubeService
+    from dataviz_core.services.ldo import LDOService
+    from dataviz_core.services.grafana import GrafanaService
+    from dataviz_core.services.eventbus import EventBusService
+    from dataviz_core.services.restore import RestoreService
+    from dataviz_core.models.backup import BackupWorkspace
+    from dataviz_core.services.accounts import AccountService
+    from dataviz_core.services.sg_connect import SGConnectService
+
+LoggerType = Union[logging.Logger, logging.LoggerAdapter]
 
 
-def _create_lifecycle_event_handler(lifecycle_service):
-    """Create and return the lifecycle event callback function."""
+class WorkspaceService(SessionManagerMixin):
+    def __init__(
+        self,
+        dataplane_cluster_id: str,
+        dataplane_service: "DataplaneService",
+        dns_service: "DNSService",
+        kube_service: "KubeService",
+        ldo_service: "LDOService",
+        grafana_service: "GrafanaService",
+        eventbus_service: "EventBusService",
+        restore_backup: "RestoreService",
+        account_service: "AccountService",
+        sg_connect: "SGConnectService",
+        workflow_executor: WorkflowExecutor,
+        session_provider: "SessionProvider",
+        repository_context: Optional["RepositoryContext"] = None,
+        logger: Optional[LoggerType] = None,
+    ):
+        self._dataplane_cluster_id = dataplane_cluster_id
+        self._dataplane = dataplane_service
+        self._dns = dns_service
+        self._kube_service = kube_service
+        self._ldo_service = ldo_service
+        self._grafana = grafana_service
+        self._eventbus = eventbus_service
+        self._account = account_service
+        self._restore_backup = restore_backup
+        self._sg_connect_service = sg_connect
+        self.workflow_executor = workflow_executor
+        super().__init__(session_provider, repository_context)
+        self.logger = logger if logger else get_default_logger(__name__)
 
-    def on_lifecycle_event(event, message):
+    def get_workspace(self, workspace_id: uuid.UUID) -> Workspace:
         try:
-            event_type, event_data = _extract_event_fields(event)
+            return self.repositories.workspace.get_by_id(id=workspace_id)
+        except Exception:
+            raise WorkspaceNotFoundError()
 
-            is_valid_event, validation_reason = _validate_lifecycle_event(
-                event,
-                event_type,
-                event_data,
+    def list(
+        self,
+        account_id: uuid.UUID,
+        limit=None,
+        offset=0,
+        filters: Iterable[FilteringCriterion] = (),
+    ) -> List[Workspace]:
+        filters = _inject_owner_in_filters(account_id, filters)
+        return [
+            workspace
+            for workspace in self.repositories.workspace.list(
+                limit=limit,
+                offset=offset,
+                filters=filters,
             )
-            if not is_valid_event:
-                logger.warning(
-                    "Skipping lifecycle event due to invalid envelope: %s | event=%s",
-                    validation_reason,
-                    event,
+        ]
+
+    def _replace_tags(self, id: UUID, tags: List[str]) -> Set[str]:
+        return self._update_tags(id, tags)
+
+    def _get_tags(self, id: UUID) -> Set[str]:
+        return self.repositories.workspace.get_by_id(id).tags
+
+    def _update_tags(self, id: UUID, tags: List[str]) -> Set[str]:
+        uniq_tags = set(tags)
+        if len(uniq_tags) > 50:
+            raise GenericInputError("A resource cannot have more than 50 tags.")
+        workspace = self.get_workspace(id)
+        workspace = self._update_workspace_with_and_return(workspace, status=Status.UPDATING)
+        with self.autocommit():
+            self.repositories.workspace.update(id, db_tags=uniq_tags)
+        workspace = self._update_workspace_with_and_return(workspace, status=Status.ACTIVE)
+        # TODO: return direct tags from workspace
+        return self._get_tags(id)
+
+    def replace_tags(self, workspace_id: uuid.UUID, tags: List[str]) -> List[str]:
+        return list(self._replace_tags(workspace_id, tags))
+
+    def request_creation(
+        self,
+        name: str,
+        tags: List[str],
+        owner_account_id: str,
+        description: str = None,
+        grafana_version: UUID = None,
+        backup_id: UUID = None,
+    ) -> Workspace:
+        backup: Union[BackupWorkspace, None] = None
+        restore_backup_id: Union[None, UUID] = None
+        # FIXME: Need to check BOTH kube namespace and DNS availability on DNS API
+        # existing_ws = self.repositories.kube_namespace.query().filter_by(name=name)
+        filters = [
+            FilteringCriterion("name", name),
+            FilteringCriterion(
+                "status",
+                [
+                    Status.CREATION_REQUESTED,
+                    Status.ACTIVE,
+                    Status.CREATING,
+                    Status.DELETING,
+                    Status.DELETION_REQUESTED,
+                ],
+                op="in",
+            ),
+        ]
+        existing_ws = self.repositories.workspace.list(filters=filters)
+        grafana_image = None
+        if not grafana_version:
+            filters = [
+                FilteringCriterion("default", True),
+            ]
+            images = self.repositories.grafana_image.list(filters=filters)
+            if images:
+                grafana_image = images[0]
+            if grafana_image is None:
+                raise WorkspaceCreationFailedError(
+                    "No default Grafana image is configured. "
+                    "Please register a default Grafana image before creating workspaces."
                 )
-                return
+        else:
+            grafana_image = self._grafana._get_grafana_image(grafana_version)
+            grafana_image = self._grafana._check_image_status(grafana_image)
 
-            # Pass the FULL event so subject/resourceOwner (top-level CloudEvent
-            # attributes) are reachable — not just the inner data payload.
-            account_id = _extract_account_id(event, event_data)
+        if backup_id:
+            backup = self.get_backup(backup_id)
 
-            if not account_id:
-                logger.warning(
-                    "Lifecycle event missing account_id — skipping. "
-                    "Checked: subject, resourceOwner, data.account_id, data.resource_id. "
-                    "event=%s",
-                    event,
-                )
-                return
+        if existing_ws:
+            raise WorkspaceAlreadyUsedError()
+        workspace_count_per_account_id = self._get_workspace_count_per_account_id(owner_account_id)
 
-            logger.info(
-                "Processing lifecycle event: type=%s account_id=%s",
-                event_type,
-                account_id,
+        if workspace_count_per_account_id >= self._account.get_soft_limit(owner_account_id):
+            raise WorkspaceLimitReachedError()
+
+        # Setup useful variables
+        common_uuid_prefix = uuid.uuid4()
+        ns_suffix = f"dv-{str(uuid.uuid4())[:5]}"
+        dns_fqdn = f"{name}-dataviz.eu-fr-paris.cloud.socgen"
+        dataplane_component_name = f"a_{str(common_uuid_prefix)[:6]}"
+        kube_stack_name = f"a-{str(common_uuid_prefix)[:6]}"
+
+        # TODO: regroup dependencies creation requests using a single helper
+        # TODO: regroup dependencies creation requests using a single helper
+
+        # FIXME: Unify IDs on all workspace dependencies
+        self.logger.info(
+            f"Requesting kube namespace creation (name='{name}' suffix='{ns_suffix}')..."
+        )
+        kube_ns = self._kube_service.request_namespace_creation(
+            suffix=ns_suffix,
+        )
+        kube_ns = self.repositories.kube_namespace.get_by_id(kube_ns.id)
+
+        # FIXME: Add name attribute unified with the random generated ID
+        self.logger.info(f"Requesting DNS creation (fqdn='{dns_fqdn}')...")
+        dns = self._dns.request_dns_creation(
+            fqdn=dns_fqdn, account_id=uuid.UUID(owner_account_id), namespace=kube_ns.id
+        )
+
+        self.logger.info(
+            f"Requesting dataplane component creation (name='{dataplane_component_name}')..."
+        )
+        database = self._dataplane.request_component_creation(
+            kube_ns.dataplane_cluster.id,
+            database_name=dataplane_component_name,
+        )
+
+        self.logger.info(f"Requesting kube stack creation (name='{kube_stack_name}')...")
+        stack = self._kube_service.request_stack_creation(
+            ws_name=name,
+            name=kube_stack_name,
+            dns_id=dns.id,
+            database_id=database.id,
+            kube_namespace_id=kube_ns.id,
+        )
+
+        self.logger.info(f"Requesting SG Connect Client creation (dns='{dns_fqdn}')...")
+        _sg_connect = self._sg_connect_service.request_sg_connect_client_id(dns_fqdn)
+
+        workspace = Workspace(
+            name=name,
+            description=description,
+            db_tags=tags,
+            owner_account_id=owner_account_id,
+            dns_id=dns.id,
+            dataplane_component_id=database.id,
+            kube_stack_id=stack.id,
+            grafana_image_id=grafana_image.id,
+            sg_connect_id=_sg_connect.id,
+        )
+
+        self.logger.info(f"Requesting Workspace creation (name='{name}')...")
+        self.logger.debug(f"Inserting workspace in the database (name='{workspace.name}')...")
+        with self.autocommit():
+            workspace = self.repositories.workspace.insert(workspace)
+
+        if backup:
+            self.logger.info("Requesting for backup restore")
+            restore_backup = self._restore_backup.request_restore_backup(
+                backup_id=backup_id,
+                workspace_id=workspace.id,
+                owner_account_id=workspace.owner_account_id,
             )
+            restore_backup_id = restore_backup.id
 
-            result = lifecycle_service.handle_event(
-                event_type=event_type,
-                account_id=account_id,
-                event_data=event_data,
+        self.logger.debug(
+            f"Adding workspace(name='{workspace.name}' creation to the broker queue...)"
+        )
+        self.workflow_executor.async_exec_core_function(
+            service="workspace",
+            function="create_workspace",
+            kwargs={"workspace_id": workspace.id, "restore_id": restore_backup_id},
+        )
+        self.logger.info(f"Workspace (name='{name}') and all of its dependencies are requested")
+
+        return workspace
+
+    def create_workspace(self, workspace_id: uuid.UUID, restore_id: uuid.UUID = None) -> Workspace:
+        restore_ws = None
+        workspace = self.repositories.workspace.get_by_id(workspace_id)
+
+        # ── Fix: short-circuit on DB ACTIVE status ──────────────────────────
+        # _refresh_workspace derives status from live dependencies, including the
+        # dataplane cluster replica Celery task.  While that task is still running
+        # (logging "nothing to update") it can transiently report CREATING even
+        # though the workspace is fully provisioned.  Without this guard every
+        # Celery retry dispatches a fresh request_cluster_replica_creation, stacking
+        # up indefinitely on the same cluster.
+        if workspace.status == Status.ACTIVE:
+            self.logger.info(f"{logname(workspace)} already ACTIVE in DB — skipping creation")
+            return workspace
+        # ────────────────────────────────────────────────────────────────────
+
+        if restore_id:
+            restore_ws = self._restore_backup.get_restore(restore_id)
+        workspace = self._refresh_workspace(workspace_id=workspace_id)
+        if workspace.status in [Status.CREATION_REQUESTED, Status.CREATING]:
+            self.logger.info(f"{logname(workspace)} will start being created")
+            return self._create_workspace(workspace, restore_ws)
+        if workspace.status == Status.ACTIVE:
+            self.logger.info(f"{logname(workspace)} already created")
+            return workspace
+        else:
+            self.logger.error(
+                f"{logname(workspace)} cannot be created due to its status: {workspace.status}"
             )
+            self._update_workspace_with(
+                workspace=workspace,
+                status=Status.FAILED,
+            )
+            raise WorkspaceCreationFailedError(workspace.id)
 
-            # Guard: handle_event must return a dict. Defensive against mocked
-            # or older implementations that may return None.
-            if not isinstance(result, dict):
-                logger.error(
-                    "handle_event returned %s instead of dict — "
-                    "cannot determine outcome. type=%s account_id=%s",
-                    type(result).__name__,
-                    event_type,
-                    account_id,
-                )
-                return
+    def _create_workspace(
+        self, workspace: Workspace, restore_ws: Union[RestoreWorkspace, None]
+    ) -> Workspace:
+        self.logger.info("waiting for dependencies to be created and in ACTIVE state")
+        workspace = self._update_workspace_with_and_return(
+            workspace=workspace,
+            status=Status.CREATING,
+        )
+        try:
+            # waiting for dependencies to be created and in ACTIVE state
+            self.logger.debug("Waiting for dns creation...")
+            self._poll_res_created(self.repositories.dns, workspace.dns.id)
+            self.logger.debug("Waiting for certificate creation...")
+            self._poll_res_created(self.repositories.certificate, workspace.dns.certificate.id)
+            self.logger.debug(">>>>>: Waiting for dataplane component creation...")
+            self._poll_res_created(
+                self.repositories.dataplane_component, workspace.dataplane_component.id
+            )
+            self.logger.debug(">>>>>: Waiting for kube stack creation...")
+            self._poll_res_created(self.repositories.kube_stack, workspace.kube_stack.id)
+        except Exception as e:
+            self.logger.info(
+                f"{logname(workspace)}: Error has happened while waiting for "
+                f"dependencies to be created"
+            )
+            self.logger.error(e, exc_info=True)
+            workspace = self._update_workspace_with_and_return(
+                workspace=workspace, status=Status.FAILED
+            )
+            self.request_workspace_deletion(
+                workspace.id, workspace.owner_account_id, is_failed=True
+            )
+            return workspace
 
-            if result.get("success"):
-                logger.info(
-                    "Lifecycle event handled successfully: type=%s account_id=%s",
-                    event_type,
-                    account_id,
+        if restore_ws:
+            self.logger.debug(">>>>>: Waiting for Workspace restore creation...")
+            self._poll_res_created(self.repositories.restore_workspace, restore_ws.id)
+        else:
+            self._ldo_service.request_ldo_account_creation(workspace)
+            self.check_grafana_url_available(workspace)
+            self._grafana.create_default_druid_datasources(workspace)
+            self._grafana.create_default_infinity_datasources(workspace)
+        workspace = self._update_workspace_with_and_return(
+            workspace=workspace, status=Status.ACTIVE
+        )
+
+        # ── Post-ACTIVE fire-and-forget housekeeping ─────────────────────────
+        # These calls run AFTER the workspace is already marked ACTIVE.  Any
+        # exception raised here must NOT propagate back to the Celery task
+        # because the worker would then retry create_workspace — re-running the
+        # full provisioning path on an already-live workspace (the loop seen in
+        # the logs).  Swallow errors here; each sub-task owns its own retry.
+
+        # TODO : Remove after kube fix
+        try:
+            temp_kube_namespace = (
+                self.repositories.temp_kube_namespace.query()
+                .filter_by(kube_namespace_id=workspace.kube_stack.kube_namespace.id)
+                .first()
+            )
+            if temp_kube_namespace is not None:
+                self._kube_service.request_temp_namespace_deletion(
+                    temp_namespace_id=temp_kube_namespace.id, workspace=workspace
                 )
             else:
-                logger.error(
-                    "Lifecycle event handling failed: type=%s account_id=%s reason=%s",
-                    event_type,
-                    account_id,
-                    result.get("reason", "unknown"),
+                self.logger.warning(
+                    f"{logname(workspace)}: temp_kube_namespace not found — "
+                    f"skipping temp namespace deletion."
+                )
+        except Exception:
+            self.logger.exception(
+                f"{logname(workspace)}: request_temp_namespace_deletion failed "
+                f"(non-fatal — workspace is already ACTIVE)."
+            )
+
+        try:
+            self._dataplane.request_cluster_replica_creation(
+                workspace.dataplane_component.dataplane_cluster
+            )
+        except Exception:
+            self.logger.exception(
+                f"{logname(workspace)}: request_cluster_replica_creation failed "
+                f"(non-fatal — workspace is already ACTIVE)."
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
+        return workspace
+
+    def check_grafana_url_available(self, workspace, retry=0):
+        try:
+            self._grafana.poll_grafana_active(workspace)
+        except ConnectionError:
+            time.sleep(RETRY_SLEEP)
+            if retry < 5:
+                retry += 1
+                return self.check_grafana_url_available(workspace, retry)
+            else:
+                self.logger.error(f"Grafana URL is not available: {workspace.dns.fqdn}")
+                raise ConnectionError("Grafana URL is not available")
+
+    def request_workspace_deletion(
+        self, workspace_id: uuid.UUID, account_id: uuid.UUID, is_failed: bool = False
+    ) -> Workspace:
+        try:
+            workspace = self.repositories.workspace.get_by_id(workspace_id)
+        except Exception:
+            raise WorkspaceNotFoundError()
+        if workspace.owner_account_id != account_id:
+            if str(account_id) not in _ADMIN_ACCOUNT_IDS_WS:
+                raise NotOwnerError(account_id, "workspace", workspace_id)
+        self.logger.info(
+            f"Requesting {logname(workspace)} deletion due to"
+            f" {'Dependent service error' if is_failed else 'user request'}"
+        )
+        self.logger.debug(f"Requesting {logname(workspace)} deletion...")
+        if workspace.status is Status.DELETED:
+            self.logger.debug(f"{logname(workspace)} already deleted")
+            return workspace
+        if not is_failed:
+            workspace = self._update_workspace_with_and_return(
+                workspace, status=Status.DELETION_REQUESTED
+            )
+
+        self.workflow_executor.async_exec_core_function(
+            service="workspace",
+            function="delete_workspace",
+            kwargs={"workspace_id": workspace.id, "is_failed": is_failed},
+        )
+        return workspace
+
+    def delete_workspace(self, workspace_id: uuid.UUID, is_failed: bool = False) -> Workspace:
+        workspace = self.repositories.workspace.get_by_id(workspace_id)
+        workspace = self._refresh_workspace(workspace.id)
+
+        self.logger.info(f"Starting {logname(workspace)} deletion")
+
+        if workspace.status is Status.CREATING:
+            self.logger.error(f"Cannot delete {logname(workspace)} while it's creating")
+            raise WorkspaceDeletionFailedError(workspace.id)
+
+        if workspace.status in [
+            Status.ACTIVE,
+            Status.INACTIVE,  # <- ADD THIS
+            Status.DELETION_REQUESTED,
+            Status.CREATION_REQUESTED,
+        ]:
+            return self._delete_workspace(workspace)
+
+        if workspace.status is Status.DELETING:
+            self.logger.error(f"{logname(workspace)} deletion already started")
+            return self._poll_deletion(workspace)
+
+        if workspace.status is Status.DELETED:
+            self.logger.error(f"{logname(workspace)} already deleted")
+            return workspace
+
+        if workspace.status in [Status.FAILED, Status.RETRYING]:
+            if is_failed:
+                return self._delete_workspace(workspace, is_failed=is_failed)
+            # <- also handle FAILED without is_failed flag
+            self.logger.warning(f"Deleting {logname(workspace)} from FAILED state")
+            return self._delete_workspace(workspace)
+
+        self.logger.error(f"Unknown status for {logname(workspace)}: '{workspace.status}'")
+        raise WorkspaceDeletionFailedError(workspace.id)
+
+    def _delete_workspace(
+        self,
+        workspace: Workspace,
+        is_failed: bool = False,
+    ) -> Workspace:
+
+        if not is_failed:
+            self.logger.info(f"Deleting {logname(workspace)}...")
+            workspace = self._update_workspace_with_and_return(
+                workspace,
+                status=Status.DELETING,
+            )
+
+        try:
+            if workspace.sg_connect is not None:
+                self._sg_connect_service.remove_redirect_url(
+                    workspace.sg_connect,
+                    workspace.dns.fqdn,
+                )
+            else:
+                self.logger.warning(
+                    f"{logname(workspace)}: No sg_connect found - "
+                    f"skipping redirect URL removal."
                 )
 
-        except Exception as e:
-            logger.error("Error processing lifecycle event: %s", e, exc_info=True)
+            self._dataplane.request_component_deletion(
+                component_id=workspace.dataplane_component.id
+            )
 
-    return on_lifecycle_event
+            self._dataplane.vault.delete_secret(
+                secret_id=workspace.dataplane_component.vault_secret_id
+            )
 
+            if workspace.dns.certificate:
+                self._dataplane.vault.delete_secret(
+                    secret_id=workspace.dns.certificate.vault_secret_id
+                )
 
-def _create_dead_letter_handler():
-    """Create and return the dead letter callback function."""
+            if workspace.kube_stack.vault_secret_id:
+                self._dataplane.vault.delete_secret(
+                    secret_id=workspace.kube_stack.vault_secret_id
+                )
+            else:
+                self.logger.warning(
+                    f"{logname(workspace)}: No kube stack vault secret found. "
+                    f"Skipping secret deletion."
+                )
 
-    def on_dead_letter(message):
-        logger.warning("Dead letter received (could not deserialize): %s", message)
+            self._dns.request_dns_deletion(
+                dns_id=workspace.dns.id
+            )
 
-    return on_dead_letter
+            self._kube_service.request_namespace_deletion(
+                namespace_id=workspace.kube_stack.kube_namespace.id,
+                stack_id=workspace.kube_stack.id,
+            )
 
+        except Exception:
+            self.logger.exception(
+                f"{logname(workspace)}: '{workspace.name}' deletion failed."
+            )
+            workspace = self._update_workspace_with_and_return(
+                workspace,
+                status=Status.DELETE_FAILED,
+            )
+            return workspace
 
-@app.task(name="consume_account_lifecycle_events", bind=True)
-def consume_account_lifecycle_events(self: Task) -> None:
-    """
-    Event Bus consumer for account lifecycle events from Accounts Team.
+        pending = [Status.DELETING]
+        target = [Status.DELETED]
 
-    ⚠️ DEPRECATED as a Celery task - use standalone deployment instead!
-    This task is kept for backward compatibility but should NOT be used
-    in the CP worker as it blocks indefinitely.
+        try:
+            poll_resource_status(
+                pending=pending,
+                target=target,
+                refresh=lambda: self._refresh_workspace(
+                    workspace_id=workspace.id
+                ).status,
+                timeout=POOLING_TIMEOUT,
+            )
+        except Exception:
+            self.logger.exception(
+                f"There was an error while waiting for "
+                f"{logname(workspace)} to reach "
+                f"'{[s.value for s in target]}'"
+            )
 
-    NEW APPROACH:
-    Deploy as a standalone service using:
-    - dataviz_async/lifecycle_consumer_main.py
-    - ccp_config_lifecycle.yaml
+        return self._refresh_workspace(workspace_id=workspace.id)
 
-    This ensures the blocking consumer runs in its own pod with
-    dedicated resources, separate from the main CP worker.
-
-    Uses the event_bus_client library (AMQP-based) with:
-    - Queue bound to topic "lifecycle"
-    - routing_key to filter lifecycle events
-    - Consumer thread with callback
-
-    Events handled:
-    - LifecycleEvent.ResourceDisabled: Account grace period
-    - LifecycleEvent.ResourceActive: Account reactivation
-    - LifecycleEvent.ResourceDeleting: Account deletion
-    - LifecycleEvent.ResourceDeleted: Account deletion completed
-    """
-    logger.info("Starting Account Lifecycle Event Bus consumer")
-
-    from event_bus_client import Consumer, Queue, Client
-
-    consumers = []
-    started_consumers = []
-
-    try:
-        lifecycle_service = get_core(app).account_lifecycle_consumer
-
-        eventbus_username = os.environ.get("EVENTBUS_USERNAME", "")
-        eventbus_password = os.environ.get("EVENTBUS_PASSWORD", "")
-        regions = _get_eventbus_regions()
-        _validate_eventbus_credentials(eventbus_username, eventbus_password, regions)
-
-        consumers = _create_lifecycle_consumers(
-            lifecycle_service,
-            eventbus_username,
-            eventbus_password,
-            regions,
-            client_class=Client,
-            queue_class=Queue,
-            consumer_class=Consumer,
+    def _poll_deletion(self, workspace: Workspace) -> Workspace:
+        return self._poll_status(
+            workspace=workspace, pending=[Status.DELETING], target=[Status.DELETED]
         )
 
-        logger.info(
-            "Lifecycle consumer started. Listening for account lifecycle events "
-            "in regions: %s",
-            ", ".join(regions),
-        )
+    @staticmethod
+    def to_dict(workspace: Workspace) -> Dict[str, Any]:
+        return {
+            "id": str(workspace.id),
+            "name": workspace.name,
+            "status": workspace.status.value,
+            "fqdn": f"https://{workspace.dns.fqdn}" if workspace.dns else "",
+            "tags": workspace.tags,
+            "imageId": (str(workspace.grafana_image.id) if workspace.grafana_image else ""),
+            "version": (
+                workspace.grafana_image.grafana_version.version if workspace.grafana_image else ""
+            ),
+            "description": workspace.description,
+            "insertionDate": format_date(workspace.insertion_date),
+            "updateDate": format_date(workspace.update_date),
+            "creationDate": format_date(workspace.creation_date),
+            "deletionDate": format_date(workspace.deletion_date),
+        }
 
-        if len(consumers) == 1:
-            consumers[0].run()
-        else:
-            for consumer in consumers:
-                consumer.start()
-                started_consumers.append(consumer)
+    def status_from_dependencies(self, current_status: Status, deps_status: Set[Status]) -> Status:
+        creating = {Status.CREATING, Status.CREATION_REQUESTED}
+        updating = {Status.UPDATE_REQUESTED, Status.UPDATING}
+        deleting = {Status.DELETING, Status.DELETION_REQUESTED, Status.DELETED}
+        crea_or_act = {Status.ACTIVE} | creating
+        not_del = crea_or_act | updating | {Status.FAILED}
 
-            for consumer in started_consumers:
-                consumer.join()
+        #: At least 1 FAILED -> FAILED
+        if Status.FAILED in deps_status:
+            return Status.FAILED
+        #: All the same -> same
+        if len(deps_status) == 1:
+            return next(iter(deps_status))
+        #: Mix of deleting and not deleting -> FAILED
+        if deps_status & creating and deps_status & deleting:
+            return Status.FAILED
+        if deps_status & {Status.ACTIVE} and deps_status & deleting:
+            return Status.DELETING
+        #: Some deps are being created -> CREATING
+        if current_status in ({Status.FAILED} | crea_or_act) and deps_status & creating:
+            return Status.CREATING
+        #: Some updating (the rest ACTIVE) -> UPDATING
+        if current_status in not_del and deps_status & updating:
+            return Status.UPDATING
+        #: Workspace not creating nor updating and deps deleting -> DELETING
+        if current_status in ({Status.ACTIVE, Status.FAILED} | deleting) and deps_status < deleting:
+            return Status.DELETING
+        #: Any other -> FAILED
+        return Status.FAILED
 
-    except KeyboardInterrupt:
-        logger.info("Lifecycle consumer interrupted")
-    except Exception as e:
-        logger.error("Fatal error in lifecycle consumer: %s", e, exc_info=True)
-        raise
-    finally:
-        for consumer in started_consumers:
+    def _get_workspace_count_per_account_id(self, owner_account_id: str) -> int:
+        """
+        Function used to get the total count of Active, Creation Requested and
+        Creating Workspace per account to restrict the user to create unwanted WS
+        """
+        filters = [
+            FilteringCriterion("owner_account_id", str(owner_account_id)),
+            FilteringCriterion(
+                "status",
+                [
+                    Status.CREATION_REQUESTED,
+                    Status.ACTIVE,
+                    Status.CREATING,
+                ],
+                op="in",
+            ),
+        ]
+        list_of_workspaces = self.repositories.workspace.list(filters=filters)
+        return len(list_of_workspaces)
+
+    def delete_failed_resources_daily(self):
+        # Fix #6: also exclude DELETED and DELETING so already-cleaned workspaces are not
+        # processed again (previously only excluded CREATION_REQUESTED, ACTIVE, CREATING)
+        filters = [
+            FilteringCriterion(
+                "status",
+                [
+                    Status.CREATION_REQUESTED,
+                    Status.ACTIVE,
+                    Status.CREATING,
+                    Status.DELETED,
+                    Status.DELETING,
+                ],
+                op="not_in",
+            ),
+            FilteringCriterion(
+                "creation_date",
+                datetime.datetime.utcnow() - datetime.timedelta(days=1),
+                op="gte",
+            ),
+        ]
+        ws_list = self.repositories.workspace.list(filters=filters)
+        for ws in ws_list:
             try:
-                consumer.stop()
+                self._dns.request_dns_deletion(dns_id=ws.dns.id)
             except Exception:
-                logger.warning("Failed to stop lifecycle consumer thread cleanly", exc_info=True)
-        logger.info("Lifecycle consumer stopped")
+                self.logger.warning(f"{logname(ws)}: DNS deletion failed, continuing cleanup.")
 
+            try:
+                if ws.dns.certificate:
+                    self._dataplane.vault.delete_secret(
+                        secret_id=ws.dns.certificate.vault_secret_id
+                    )
+            except Exception:
+                self.logger.warning(f"{logname(ws)}: Certificate secret deletion failed, continuing.")
 
-app.conf.timezone = "UTC"
-app.conf.beat_schedule = {
-    "update_health_cache_every_5_minutes": {
-        "task": "update_health_cache",
-        "schedule": crontab(minute="*/5"),
-    },
-    "backup_status_update_every_5_minutes": {
-        "task": "backup_status_update",
-        "schedule": crontab(minute="*/5"),
-    },
-    "check_certificate_expiration_every_day_midnight": {
-        "task": "check_certificate_expiration",
-        "schedule": crontab(hour=0, minute=0),
-    },
-    "account_reconciliation_daily": {
-        "task": "account_reconciliation",
-        "schedule": crontab(hour=0, minute=0),
-        "options": {
-            "expires": 3600,
-        },
-    },
-}
+            try:
+                self._dataplane.request_component_deletion(
+                    component_id=ws.dataplane_component.id
+                )
+            except Exception:
+                self.logger.warning(f"{logname(ws)}: Dataplane deletion failed, continuing cleanup.")
+
+            try:
+                self._kube_service.request_namespace_deletion(
+                    namespace_id=ws.kube_stack.kube_namespace.id,
+                    stack_id=ws.kube_stack.id,
+                )
+            except Exception:
+                self.logger.warning(f"{logname(ws)}: Kube namespace deletion failed, continuing.")
+
+            self._update_workspace_with_and_return(ws, status=Status.DELETED)
+
+    def get_backup(self, backup_id: UUID) -> "BackupWorkspace":
+        try:
+            backup = self.repositories.backup_workspace.get_by_id(backup_id)
+        except Exception as e:
+            self.logger.error(f"Error while getting backup. Error: {e}")
+            raise BackupNotFoundError()
+        return backup
+
+    def upgrade_workspace(self, workspace_id: UUID) -> Workspace:
+        """
+        Upgrades the specified workspace.
+
+        Parameters:
+            workspace_id (UUID): The UUID of the workspace to upgrade.
+
+        Returns:
+            Workspace: The upgraded workspace.
+
+        Raises:
+            None
+        """
+        workspace = self.get_workspace(workspace_id)
+        self.logger.info(f"Upgrading {logname(workspace)}...")
+        if workspace.status == Status.UPDATING:
+            return workspace
+        elif workspace.status == Status.UPDATE_REQUESTED:
+            workspace = self._update_workspace_with_and_return(
+                workspace=workspace, status=Status.UPDATING
+            )
+            workspace = self._upgrade_workspace(workspace)
+        elif workspace.status != Status.ACTIVE:
+            self.logger.error(
+                f"Cannot reset {logname(workspace)} while it's in {workspace.status} status"
+            )
+            return workspace
+        return workspace
+
+    def _upgrade_workspace(self, workspace: Workspace) -> Workspace:
+        """
+        Upgrades the given workspace by upgrading the kube stack and updating the workspace status.
+
+        Args:
+            workspace (Workspace): The workspace to be upgraded.
+
+        Returns:
+            Workspace: The upgraded workspace.
+
+        Raises:
+            None
+        """
+        self.logger.info(f"Upgrading {logname(workspace)}...")
+        try:
+            kube_stack = self._kube_service.upgrade_kube_setup(workspace.kube_stack)
+            if kube_stack.status == Status.ACTIVE:
+                workspace = self._update_workspace_with_and_return(workspace, status=Status.ACTIVE)
+            else:
+                self.logger.error(f"Upgrade failed for {logname(workspace)}")
+                workspace = self._update_workspace_with_and_return(workspace, status=Status.FAILED)
+        except Exception as e:
+            self.logger.error(f"Upgrade failed for {logname(workspace)}. Error: {e}")
+            workspace = self._update_workspace_with_and_return(workspace, status=Status.FAILED)
+        return workspace
+
+    def request_workspace_custom_configuration(
+        self,
+        workspace_id: UUID,
+        configuration: Dict,
+        owner_account_id: str,
+    ):
+        """
+        Update the custom configuration of a workspace.
+
+        Args:
+            workspace_id (UUID): The ID of the workspace.
+            configuration (Dict): A dictionary containing the custom configuration to be updated.
+            owner_account_id (str): The ID of the owner account.
+
+        Returns:
+            Workspace: The updated workspace object.
+            Returns:
+            Workspace: The updated workspace object.
+
+        Raises:
+            NotOwnerError: If the owner account ID does not match the workspace's owner account ID.
+            WorkspaceStatusNotActiveError: If the workspace status is not active.
+            GrafanaCustomConfigurationInputError: If an invalid configuration key is provided.
+        """
+        workspace = self.get_workspace(workspace_id)
+        if str(workspace.owner_account_id) != owner_account_id:
+            raise NotOwnerError(owner_account_id, "workspace", workspace_id)
+        if workspace.status != Status.ACTIVE:
+            raise WorkspaceStatusNotActiveError(workspace_id)
+        is_sg_connect_value = None
+        # Fix #3: work on a local copy so the shared module-level dict is never mutated
+        config_copy = dict(GRAFANA_DEFAULT_CONFIGURATION)
+        for each_key, each_value in configuration.items():
+            try:
+                key = GRAFANA_CUSTOM_CONFIGURATION[each_key]
+                _each_value = WorkspaceService.parse_config_values(each_value)
+                config_copy[key] = _each_value
+                if each_key == "isPublicWorkspace":
+                    is_sg_connect_value = configuration.get("isPublicWorkspace")
+            except KeyError:
+                raise GrafanaCustomConfigurationInputError(f"Invalid configuration key: {each_key}")
+        update_kwargs = {
+            "status": Status.UPDATE_REQUESTED,
+            "custom_configurations": config_copy,
+        }
+
+        if is_sg_connect_value is not None:
+            update_kwargs["is_sg_connect"] = is_sg_connect_value
+
+        workspace = self._update_workspace_with_and_return(workspace, **update_kwargs)
+
+        self.workflow_executor.async_exec_core_function(
+            service="workspace",
+            function="upgrade_workspace",
+            kwargs={"workspace_id": workspace.id},
+        )
+        return workspace
+
+    @staticmethod
+    def parse_config_values(config_val: Union[bool, List[str]]) -> str:
+        """
+        Converts the given configuration value to a string representation.
+
+        Parameters:
+            config_val (Union[bool, List[str]]): The configuration value to be converted.
+
+        Returns:
+            str: The string representation of the configuration value.
+
+        """
+        if isinstance(config_val, bool):
+            return str(config_val).lower()
+        return ",".join(config_val)
+
+    @staticmethod
+    def process_config_values(value: str) -> Union[bool, List[str]]:
+        """
+        Converts the given configuration value to its original type.
+
+        Parameters:
+            value (str): The configuration value to be converted.
+
+        Returns:
+            Union[bool, List[str]]: The original type of the configuration value.
+
+        """
+        if value.lower() == "true":
+            return True
+        elif value.lower() == "false":
+            return False
+        else:
+            return value.split(",") if value else []
+
+    @staticmethod
+    def get_workspace_alias_config(workspace_config: Dict) -> Dict[str, Any]:
+        """
+        Returns the alias configuration for a workspace.
+
+        Args:
+            workspace_config (Dict): The configuration of the workspace.
+
+        Returns:
+            Dict[str, Any]: The alias configuration for the workspace.
+
+        """
+        if workspace_config:
+            res = {
+                _k: WorkspaceService.process_config_values(workspace_config[_v])
+                for _k, _v in GRAFANA_CUSTOM_CONFIGURATION.items()
+                if _v in workspace_config
+            }
+        else:
+            res = ALIAS_GRAFANA_DEFAULT_CONFIGURATION
+        return res
+
+    @staticmethod
+    def workspace_config_to_dict(workspace: Workspace) -> Dict[str, Any]:
+        """
+        Converts a Workspace object to a dictionary representation.
+
+        Parameters:
+            workspace (Workspace): The Workspace object to convert.
+
+        Returns:
+            dict: A dictionary representation of the Workspace object with the following keys:
+                - "configuration" (dict): The custom configurations of the workspace.
+        """
+        config = WorkspaceService.get_workspace_alias_config(workspace.custom_configurations)
+        return {
+            "configuration": config,
+        }
+
+    def deactivate_workspaces_by_owner_account_id(self, owner_account_id: uuid.UUID) -> List[Dict]:
+        workspace_updates = []
+        filters = [
+            FilteringCriterion("owner_account_id", owner_account_id),
+            FilteringCriterion("status", Status.ACTIVE),
+        ]
+        workspaces = self.repositories.workspace.list(filters=filters)
+
+        for workspace in workspaces:
+            _workspace_updates = {}
+            self.logger.info(f"Starting {logname(workspace)} deactivation")
+
+            if workspace.status is not Status.ACTIVE:
+                self.logger.error(
+                    f"Cannot deactivate {logname(workspace)} while it's {workspace.status}"
+                )
+                _workspace_updates["workspace_id"] = str(workspace.id)
+                _workspace_updates["status"] = (
+                    f"account status not in active state. "
+                    f"Current status is {workspace.status.value}"
+                )
+                _workspace_updates["name"] = workspace.name
+                workspace_updates.append(_workspace_updates)
+                continue
+
+            if workspace.status is Status.ACTIVE:
+                try:
+                    workspace_res = self._deactivate_workspace(workspace)
+                    _workspace_updates["workspace_id"] = str(workspace_res.id)
+                    _workspace_updates["status"] = "deactivated"
+                    _workspace_updates["name"] = workspace_res.name
+                    workspace_updates.append(_workspace_updates)
+                except WorkspaceDeActivationFailedError as e:
+                    _workspace_updates["workspace_id"] = str(workspace.id)
+                    _workspace_updates["status"] = "deactivation failed"
+                    _workspace_updates["name"] = workspace.name
+                    workspace_updates.append(_workspace_updates)
+                    self.logger.error(f"Deactivation failed for {logname(workspace)}. Error: {e}")
+                    continue
+
+            if workspace.status is Status.INACTIVE:
+                self.logger.error(f"{logname(workspace)} already inactive")
+                _workspace_updates["workspace_id"] = str(workspace.id)
+                _workspace_updates["status"] = "account status already in inactive state"
+                _workspace_updates["name"] = workspace.name
+                workspace_updates.append(_workspace_updates)
+                continue
+
+        return workspace_updates
+
+    def _deactivate_workspace(self, workspace: Workspace) -> Workspace:
+        self.logger.info(f"Deactivating {logname(workspace)}...")
+
+        try:
+            self._kube_service.request_stack_deletion(
+                workspace.kube_stack,
+            )
+        except Exception:
+            self.logger.exception(f"{logname(workspace)}: '{workspace.name}' kube deletion failed.")
+            return self._update_workspace_with_and_return(workspace, status=Status.FAILED)
+
+        return self._update_workspace_with_and_return(workspace, status=Status.INACTIVE)
+
+    def reactivate_workspaces_by_owner_account_id(
+        self,
+        account_activation_id: uuid.UUID,
+    ) -> List[Dict]:
+        workspace_updates = []
+        filters = [
+            FilteringCriterion("owner_account_id", account_activation_id),
+            FilteringCriterion("status", Status.INACTIVE),
+        ]
+        workspaces = self.repositories.workspace.list(filters=filters)
+        for workspace in workspaces:
+            _workspace_updates = {}
+            self.logger.info(
+                f"Requesting {logname(workspace)} Activation due to "
+                f"Account Activation request from account event lifecycle"
+            )
+            self.logger.debug(f"Requesting {logname(workspace)} Activation...")
+            try:
+                # Call _activate_workspace directly instead of reactivate_workspace
+                # because reactivate_workspace calls _refresh_workspace which checks
+                # Kubernetes status — if kube deletion partially failed during
+                # deactivation, Kubernetes may still report ACTIVE even though
+                # DB says INACTIVE, causing reactivate_workspace to reject it.
+                # We trust the DB filter above (status=INACTIVE) and force activation.
+                workspace_res = self._activate_workspace(workspace)
+
+                _workspace_updates["workspace_id"] = str(workspace_res.id)
+                _workspace_updates["status"] = "reactivated"
+                _workspace_updates["name"] = workspace_res.name
+                workspace_updates.append(_workspace_updates)
+
+            except WorkspaceActivationFailedError as e:
+                _workspace_updates["workspace_id"] = str(workspace.id)
+                _workspace_updates["status"] = "reactivation failed"
+                _workspace_updates["name"] = workspace.name
+                workspace_updates.append(_workspace_updates)
+                self.logger.error(f"Reactivation failed for {logname(workspace)}. Error: {e}")
+                continue
+
+        self.logger.info(
+            f"Workspace reactivation process completed "
+            f"and workspace updates collected {workspace_updates}."
+        )
+        return workspace_updates
+
+    def reactivate_workspace(self, workspace_id: uuid.UUID) -> Workspace:
+        workspace = self.repositories.workspace.get_by_id(workspace_id)
+
+        self.logger.info(f"Starting {logname(workspace)} Re-Activation")
+
+        # Trust the DB status — do NOT call _refresh_workspace here
+        # because if kube deletion partially failed during deactivation,
+        # _refresh_workspace will report ACTIVE from Kubernetes even though
+        # DB correctly says INACTIVE — causing activation to be rejected.
+        if workspace.status is Status.ACTIVE:
+            self.logger.error(
+                f"Cannot activate {logname(workspace)} while it's already {workspace.status}"
+            )
+            raise WorkspaceActivationFailedError(workspace.id)
+
+        if workspace.status is Status.INACTIVE:
+            # Trust DB — activate directly
+            return self._activate_workspace(workspace)
+
+        # Any other status — fail safely
+        self.logger.error(f"Unknown status for {logname(workspace)}: {workspace.status}")
+        raise WorkspaceActivationFailedError(workspace.id)
+
+    def _activate_workspace(self, workspace: Workspace) -> Workspace:
+        self.logger.info(f"Reactivating {logname(workspace)}...")
+
+        try:
+            kube_stack = workspace.kube_stack
+
+            if kube_stack is None:
+                self.logger.error(f"{logname(workspace)}: No kube stack found — cannot reactivate")
+                raise WorkspaceActivationFailedError(workspace.id)
+
+            self._kube_service._update_stack_with(
+                kube_stack,
+                status=Status.CREATION_REQUESTED,
+            )
+
+            self._kube_service.workflow_executor.async_exec_core_function(
+                service="kube",
+                function="reactivate_stack",
+                kwargs={
+                    "stack_id": kube_stack.id,
+                    "temp_ns_check": False,
+                },
+            )
+
+            self.logger.info(
+                f"{logname(workspace)}: Kube stack reactivation requested "
+                f"for stack_id={kube_stack.id}"
+            )
+
+        except WorkspaceActivationFailedError:
+            raise
+        except Exception:
+            self.logger.exception(
+                f"{logname(workspace)}: '{workspace.name}' kube reactivation failed."
+            )
+            return self._update_workspace_with_and_return(workspace, status=Status.FAILED)
+
+        return self._update_workspace_with_and_return(
+            workspace,
+            status=Status.ACTIVE,
+        )
+
+    def delete_workspaces_by_owner_account_id(
+        self,
+        owner_account_id: uuid.UUID,
+    ) -> List[Dict]:
+        workspace_updates = []
+
+        # Fetch ALL workspaces for this owner regardless of status
+        # so INACTIVE and FAILED workspaces are also deleted
+        filters = [
+            FilteringCriterion("owner_account_id", owner_account_id),
+        ]
+
+        workspaces = self.repositories.workspace.list(filters=filters)
+
+        for workspace in workspaces:
+            _workspace_updates = {}
+            self.logger.info(f"Starting {logname(workspace)} deletion")
+
+            if workspace.status is Status.DELETED:
+                self.logger.info(f"{logname(workspace)} already deleted - skipping")
+                _workspace_updates["workspace_id"] = str(workspace.id)
+                _workspace_updates["status"] = "already deleted"
+                _workspace_updates["name"] = workspace.name
+                workspace_updates.append(_workspace_updates)
+                continue
+
+            if workspace.status in {
+                Status.ACTIVE,
+                Status.INACTIVE,
+                Status.FAILED,
+            }:
+                try:
+                    workspace_res = self.delete_workspace(workspace.id)
+
+                    _workspace_updates["workspace_id"] = str(workspace_res.id)
+                    _workspace_updates["status"] = "deleted"
+                    _workspace_updates["name"] = workspace_res.name
+                    workspace_updates.append(_workspace_updates)
+
+                except WorkspaceDeletionFailedError as e:
+                    # Even if deletion failed, force status to DELETED
+                    self.logger.error(
+                        f"Deletion failed for {logname(workspace)}. "
+                        f"Forcing DELETED status. Error: {e}"
+                    )
+
+                    self._update_workspace_with(
+                        workspace,
+                        status=Status.DELETED,
+                    )
+
+                    _workspace_updates["workspace_id"] = str(workspace.id)
+                    _workspace_updates["status"] = "deleted"
+                    _workspace_updates["name"] = workspace.name
+                    workspace_updates.append(_workspace_updates)
+
+        return workspace_updates
