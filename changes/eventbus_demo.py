@@ -52,6 +52,7 @@ Usage (single event):
     python eventbus_demo.py --account-id <uuid> --event-type ResourceDeleting
     python eventbus_demo.py --account-id <uuid> --event-type ResourceDeleted
 
+    python eventbus_demo.py --account-id <uuid> --event-type ResourceDeleted --live for live
 Supported event types (short or full form both accepted):
     ResourceDisabled   /  LifecycleEvent.ResourceDisabled
     ResourceActive     /  LifecycleEvent.ResourceActive
@@ -388,6 +389,55 @@ class InMemoryWorkspaceRepo:
         return updated
 
 
+class MockMonitoringService:
+    """
+    Mirrors core/monitoring_client.py MonitoringClient.send_notification().
+
+    Real signature:
+        send_notification(self, error_level, email_body, email_subject) -> bool
+
+    In production:
+        - Gets an IAM token via sg_iamaas.create_token()
+        - POSTs to https://monitoring.eu-fr-paris.cloud.socgen/v2/notifications/emails
+        - Returns True on HTTP 202, raises MonitoringError on 400/401
+
+    In this demo:
+        - Prints the alert to stdout so you can see it
+        - Stores it in sent_alerts[] for post-run inspection
+        - Returns True (mirrors the real success path)
+    """
+
+    def __init__(self):
+        self._log = logging.getLogger("MonitoringClient")
+        self.sent_alerts: List[dict] = []   # stores alerts for inspection
+
+    def send_notification(
+        self,
+        error_level: str,
+        email_body: str,
+        email_subject: str,
+    ) -> bool:
+        """
+        Mirrors MonitoringClient.send_notification(error_level, email_body, email_subject).
+        NOTE: email_body comes BEFORE email_subject — matches the real client signature.
+        """
+        self._log.error(
+            f"\n"
+            f"  +------------------------------------------------------------------+\n"
+            f"  |  [ALERT EMAIL]  error_level : {error_level:<34}|\n"
+            f"  |  subject : {email_subject:<58}|\n"
+            f"  +------------------------------------------------------------------+\n"
+            f"{email_body}"
+        )
+        # In production: POSTs to monitoring API.  In demo: stores for assertion.
+        self.sent_alerts.append({
+            "error_level"  : error_level,
+            "email_subject": email_subject,
+            "email_body"   : email_body,
+        })
+        return True   # mirrors HTTP 202 success path
+
+
 class MockWorkflowExecutor:
     """
     Simulates the Celery async worker.
@@ -426,11 +476,16 @@ class MockAccountService:
         workspace_repo: InMemoryWorkspaceRepo,
         eventbus_adapter: Optional[EventBusAdapter] = None,
     ):
-        self._accounts   = account_repo
-        self._workspaces = workspace_repo
-        self._eventbus   = eventbus_adapter
+        self._accounts         = account_repo
+        self._workspaces       = workspace_repo
+        self._eventbus         = eventbus_adapter
         self.workflow_executor = None          # injected after construction
-        self.logger      = logging.getLogger("AccountService")
+        self.monitoring_service = None         # injected via set_monitoring_service()
+        self.logger            = logging.getLogger("AccountService")
+
+    def set_monitoring_service(self, monitoring_service) -> None:
+        """Inject MockMonitoringService (mirrors AccountService.set_monitoring_service)."""
+        self.monitoring_service = monitoring_service
 
     # ── lifecycle event router ────────────────────────────────────────────────
 
@@ -609,7 +664,7 @@ class MockAccountService:
         LifecycleEvent.ResourceDeleted
         → Accounts Team confirms deletion is complete.
         → We verify no residual workspaces remain.
-        → If residuals exist, we alert (normally sends an email).
+        → If residuals exist, send alert via MonitoringService (email in production).
         """
         self.logger.info(
             f"  [ResourceDeleted] Account {account_id} — final cleanup verification."
@@ -629,15 +684,33 @@ class MockAccountService:
             )
             return
 
-        # Residual resources — send alert
+        # Residual resources found — log error and send alert
         self.logger.error(
             f"  ❌  Account {account_id}: {len(remaining)} workspace(s) NOT yet deleted!"
         )
-        for w in remaining:
-            self.logger.error(f"       Residual: {w}")
-        self.logger.error(
-            "  📧  [ALERT] Notification email would be sent to Dataviz team for manual cleanup."
+
+        workspace_details = "\n".join([
+            f"    - Workspace: {w.name}  id={w.id}  status={w.status.value}"
+            for w in remaining
+        ])
+        email_subject = f"Manual Cleanup Required: Account {account_id}"
+        email_body = (
+            f"Account {account_id} has been marked as DELETED by Accounts Team,\n"
+            f"but {len(remaining)} workspace(s) could not be deleted automatically.\n\n"
+            f"Remaining workspaces:\n{workspace_details}\n\n"
+            f"Please investigate and manually clean up these resources."
         )
+
+        if self.monitoring_service is not None:
+            self.monitoring_service.send_notification(
+                error_level="ERROR",
+                email_subject=email_subject,
+                email_body=email_body,
+            )
+        else:
+            self.logger.warning(
+                "  monitoring_service not set — alert NOT sent (would be sent in production)."
+            )
 
     # ── helper for inspecting state ───────────────────────────────────────────
 
@@ -871,6 +944,11 @@ def main() -> None:
     executor = MockWorkflowExecutor(account_service_ref=account_service)
     account_service.workflow_executor = executor
 
+    # ── Inject MonitoringService (sends email when residual workspaces found) ──
+    # mirrors: core/core.py  self.account.set_monitoring_service(self.monitoring)
+    monitoring = MockMonitoringService()
+    account_service.set_monitoring_service(monitoring)
+
     # ── Consumer (subscriber side) ────────────────────────────────────────────
     queue = Queue(
         client=eb_client,
@@ -942,13 +1020,43 @@ def main() -> None:
 
     # Scenario 4: Accounts Team confirms account is fully deleted — we verify
     demo_consumer_scenario(
-        title         = "ResourceDeleted — final cleanup verification",
+        title         = "ResourceDeleted — final cleanup verification (clean)",
         event_type    = "LifecycleEvent.ResourceDeleted",
         account_id    = ACCOUNT_ID,
         account_service=account_service,
         consumer      = consumer,
         source_fqdn   = FQDN_SOURCE,
     )
+
+    # ════════════════════════════════════════════════════════════════════════
+    # BONUS SCENARIO: ResourceDeleted with RESIDUAL workspaces still present
+    # This is the path that triggers the MonitoringService email alert.
+    # ════════════════════════════════════════════════════════════════════════
+    section("BONUS — ResourceDeleted with RESIDUAL workspaces (triggers email alert)")
+
+    # Seed a second account that has workspaces still ACTIVE (deletion failed)
+    STALE_ACCOUNT_ID = "deadbeef-dead-beef-dead-beefdeadbeef"
+    account_repo.save(AccountDetails(owner_account_id=STALE_ACCOUNT_ID, status=Status.DELETED))
+    workspace_repo.save(Workspace(name="grafana-orphaned", owner_account_id=STALE_ACCOUNT_ID, status=Status.ACTIVE))
+    workspace_repo.save(Workspace(name="grafana-stuck",    owner_account_id=STALE_ACCOUNT_ID, status=Status.INACTIVE))
+
+    print(f"\n  Account {STALE_ACCOUNT_ID} was marked DELETED but workspaces were NOT cleaned up.")
+    print(f"  Accounts Team now sends ResourceDeleted — Dataviz must detect and alert.\n")
+
+    demo_consumer_scenario(
+        title         = "ResourceDeleted — RESIDUAL workspaces found (email alert sent!)",
+        event_type    = "LifecycleEvent.ResourceDeleted",
+        account_id    = STALE_ACCOUNT_ID,
+        account_service=account_service,
+        consumer      = consumer,
+        source_fqdn   = FQDN_SOURCE,
+    )
+
+    if monitoring.sent_alerts:
+        print(f"\n  MonitoringService.sent_alerts ({len(monitoring.sent_alerts)} total):")
+        for i, alert in enumerate(monitoring.sent_alerts, 1):
+            print(f"    [{i}] level={alert['error_level']}  subject={alert['email_subject']}")
+    print()
 
     # ════════════════════════════════════════════════════════════════════════
     # UNKNOWN EVENT TYPE — shows the graceful ignore path
@@ -1065,25 +1173,68 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # ── --live flag ────────────────────────────────────────────────────────────
+    # ── --live flag: initialise the real Dataviz core and call the handler ─────
+    # Mirrors async/lifecycle_demo.py _run_live() — merged here so there is
+    # a single demo file.  Requires the same env vars as the production consumer:
+    #   DATABASE_URI, ADMIN_ACCOUNTS, EVENTBUS_* etc.
     if args.live:
-        print(
-            "\n  ⚠️   --live mode is NOT implemented in this demo file.\n"
-            "\n"
-            "  This file is a self-contained architecture demo that uses\n"
-            "  in-memory stubs. To run against a real CCP deployment use:\n"
-            "\n"
-            "      python async/lifecycle_demo.py \\\n"
-            "          --account-id <uuid> \\\n"
-            "          --event-type ResourceDisabled \\\n"
-            "          --live\n"
-            "\n"
-            "  That script requires the following environment variables:\n"
-            "      EVENTBUS_USERNAME        EVENTBUS_PASSWORD\n"
-            "      EVENTBUS_HOST            DATABASE_URI\n"
-            "      CELERY_BROKER_URL        CELERY_RESULT_BACKEND\n"
-            "      CCP_REGION               CCP_NAMESPACE\n"
+        if not args.event_type:
+            print("\n  ❌  --live requires --event-type.\n")
+            sys.exit(1)
+
+        account_id_live = args.account_id or "79fadc0d-90d9-45fe-9ab9-bbfbc4a2a28a"
+        event_type_live = _SHORT_TO_FULL.get(args.event_type, args.event_type)
+        if event_type_live not in _SCENARIO_TITLES:
+            print(f"\n  ❌  Unknown event type: '{args.event_type}'\n")
+            sys.exit(1)
+
+        _live_log = logging.getLogger("lifecycle_demo.live")
+        _live_log.info("Account Lifecycle EventBus Demo — LIVE MODE")
+        _live_log.info("  account_id : %s", account_id_live)
+        _live_log.info("  event_type : %s", event_type_live)
+
+        try:
+            from sg_cacert_file import load_sg_certs  # type: ignore
+            load_sg_certs()
+        except ImportError:
+            _live_log.warning("sg_cacert_file not available — skipping cert load.")
+
+        try:
+            from dataviz_async import core as async_core  # type: ignore
+            from dataviz_async.app import app             # type: ignore
+            async_core.init_app(app)
+            lifecycle_service = async_core.get_core(app).account_lifecycle_consumer
+        except Exception as exc:
+            _live_log.error("Failed to initialise core: %s", exc, exc_info=True)
+            _live_log.error(
+                "Make sure all required env vars are set "
+                "(DATABASE_URI, ADMIN_ACCOUNTS, EVENTBUS_*, ...) "
+                "and all services are reachable."
+            )
+            sys.exit(1)
+
+        _live_log.info("Core initialised. Calling lifecycle handler...")
+        _live_log.info(
+            "  handle_event(event_type='%s', account_id='%s')",
+            event_type_live, account_id_live,
         )
+        _live_log.info("  business: %s", _SCENARIO_TITLES.get(event_type_live, "unknown"))
+
+        result = lifecycle_service.handle_event(
+            event_type=event_type_live,
+            account_id=account_id_live,
+            event_data={},
+        )
+
+        _live_log.info("── RESULT ──────────────────────────────────────────────")
+        if isinstance(result, dict):
+            if result.get("success"):
+                _live_log.info("  ✅  success=True — lifecycle event handled OK.")
+            else:
+                _live_log.error("  ❌  success=False — reason: %s", result.get("message", "unknown"))
+        else:
+            _live_log.info("  handler returned: %s", result)
+
         sys.exit(0)
 
     # ── single-event mode  (--account-id + --event-type) ──────────────────────
