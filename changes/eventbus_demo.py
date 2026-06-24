@@ -314,6 +314,8 @@ def _run_ccp_live(event: dict, event_type: str, account_id: str) -> None:
 def _run_live(event: dict, event_type: str, account_id: str) -> None:
     """
     Initialise the real Dataviz core and call the lifecycle handler directly.
+    Uses the CCP event format (new.json) — owner account ID is extracted from
+    the ownerId SRN in event["data"]["resource"]["ownerId"].
     Requires the same environment variables as the production consumer.
     """
     logger.info("Initialising Dataviz core (live mode)...")
@@ -337,14 +339,21 @@ def _run_live(event: dict, event_type: str, account_id: str) -> None:
         )
         sys.exit(1)
 
+    # Extract owner account UUID from the ownerId SRN in the CCP event payload.
+    # Format: "srn:sgcp:account.cloud.socgen:account:<uuid>"  →  last ":" segment.
+    owner_id_srn = event.get("data", {}).get("resource", {}).get("ownerId", "")
+    extracted_account_id = owner_id_srn.split(":")[-1] if owner_id_srn else account_id
+
     logger.info("Core initialised. Calling lifecycle handler...")
     logger.info("── HANDLER CALL ────────────────────────────────────────")
-    logger.info("  handle_event(event_type='%s', account_id='%s')", event_type, account_id)
-    logger.info("  business: %s", BUSINESS_ACTION.get(event_type, "unknown"))
+    logger.info("  ownerId SRN : %s", owner_id_srn)
+    logger.info("  account_id  : %s", extracted_account_id)
+    logger.info("  event_type  : %s", event_type)
+    logger.info("  business    : %s", BUSINESS_ACTION.get(event_type, "unknown"))
 
     result = lifecycle_service.handle_event(
         event_type=event_type,
-        account_id=account_id,
+        account_id=extracted_account_id,
         event_data=event.get("data", {}),
     )
 
@@ -430,7 +439,7 @@ def main() -> None:
     logger.info("  event_type : %s", event_type)
     logger.info("  mode       : %s", mode_label)
 
-    if args.ccp_live:
+    if args.ccp_live or args.live:
         event = _build_ccp_cloudevent(args.account_id, event_type)
     else:
         event = _build_cloudevent(args.account_id, event_type)
