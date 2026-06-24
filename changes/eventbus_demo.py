@@ -52,6 +52,7 @@ Usage (single event):
     python eventbus_demo.py --account-id <uuid> --event-type ResourceDeleting
     python eventbus_demo.py --account-id <uuid> --event-type ResourceDeleted
 
+    python eventbus_demo.py --account-id <uuid> --event-type ResourceDeleted --dry-run
     python eventbus_demo.py --account-id <uuid> --event-type ResourceDeleted --live for live
 Supported event types (short or full form both accepted):
     ResourceDisabled   /  LifecycleEvent.ResourceDisabled
@@ -1167,6 +1168,15 @@ if __name__ == "__main__":
         help="Run a single consumer scenario for this event type only",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run the full lifecycle action (deactivate / reactivate / delete …) "
+            "using hardcoded demo data — no CCP, no DB, no EventBus needed. "
+            "Requires --event-type."
+        ),
+    )
+    parser.add_argument(
         "--live",
         action="store_true",
         help="Connect to real CCP infrastructure (requires env vars — see below)",
@@ -1234,6 +1244,72 @@ if __name__ == "__main__":
                 _live_log.error("  ❌  success=False — reason: %s", result.get("message", "unknown"))
         else:
             _live_log.info("  handler returned: %s", result)
+
+        sys.exit(0)
+
+    # ── --dry-run flag ────────────────────────────────────────────────────────
+    # Runs the full lifecycle action (deactivate / reactivate / delete …) using
+    # hardcoded demo data and CloudEvents — exactly what the old --live did when
+    # CCP was not available.  No real EventBus, no DB, no Celery needed.
+    if args.dry_run:
+        if not args.event_type:
+            print("\n  ❌  --dry-run requires --event-type.\n")
+            sys.exit(1)
+
+        event_type_dr = _SHORT_TO_FULL.get(args.event_type, args.event_type)
+        if event_type_dr not in _SCENARIO_TITLES:
+            print(f"\n  ❌  Unknown event type: '{args.event_type}'\n")
+            sys.exit(1)
+
+        ACCOUNT_ID_DR  = args.account_id or "79fadc0d-90d9-45fe-9ab9-bbfbc4a2a28a"
+        FQDN_SOURCE_DR = "ocs-uat.eu-fr-paris.cloud.socgen"
+
+        # Wire up in-memory stubs (same as single-event mode)
+        eb_client_dr   = Client(user="svc-dataviz", password="s3cr3t", region="eu-fr-paris")
+        adapter_dr     = EventBusAdapter(eventbus_account=eb_client_dr, account_id=ACCOUNT_ID_DR, fqdn_source=FQDN_SOURCE_DR)
+        account_repo_dr   = InMemoryAccountRepo()
+        workspace_repo_dr = InMemoryWorkspaceRepo()
+        account_svc_dr = MockAccountService(
+            account_repo=account_repo_dr,
+            workspace_repo=workspace_repo_dr,
+            eventbus_adapter=adapter_dr,
+        )
+        executor_dr = MockWorkflowExecutor(account_service_ref=account_svc_dr)
+        account_svc_dr.workflow_executor = executor_dr
+        monitoring_dr = MockMonitoringService()
+        account_svc_dr.set_monitoring_service(monitoring_dr)
+
+        queue_dr = Queue(
+            client=eb_client_dr,
+            alias="dataviz-lifecycle-consumer",
+            topic="lifecycle",
+            routing_key=list(_SCENARIO_TITLES.keys()),
+        )
+        consumer_dr = Consumer(
+            queue=queue_dr,
+            callback=build_consumer_callback(account_svc_dr),
+            auto_ack=True,
+        )
+
+        # Seed demo account + workspaces
+        account_repo_dr.save(AccountDetails(owner_account_id=ACCOUNT_ID_DR, status=Status.ACTIVE))
+        for ws_name_dr in ["grafana-prod", "grafana-dev", "grafana-staging"]:
+            workspace_repo_dr.save(Workspace(name=ws_name_dr, owner_account_id=ACCOUNT_ID_DR, status=Status.ACTIVE))
+
+        # Run the scenario (CloudEvent → consumer → handler → before/after state)
+        demo_consumer_scenario(
+            title          = _SCENARIO_TITLES[event_type_dr],
+            event_type     = event_type_dr,
+            account_id     = ACCOUNT_ID_DR,
+            account_service= account_svc_dr,
+            consumer       = consumer_dr,
+            source_fqdn    = FQDN_SOURCE_DR,
+        )
+
+        if monitoring_dr.sent_alerts:
+            print(f"\n  MonitoringService.sent_alerts ({len(monitoring_dr.sent_alerts)} total):")
+            for i, alert in enumerate(monitoring_dr.sent_alerts, 1):
+                print(f"    [{i}] level={alert['error_level']}  subject={alert['email_subject']}")
 
         sys.exit(0)
 
