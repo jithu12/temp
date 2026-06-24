@@ -1,1045 +1,920 @@
-#!/usr/bin/env python3
-"""
-Demo: Simulate the full EventBus lifecycle round-trip without a real EventBus connection.
-
-Builds valid CloudEvent payloads and runs them through the complete
-publisher → broker → consumer → handler pipeline using in-memory stubs.
-No external packages, no database, no Celery, no CCP deployment needed.
-Works with OR without a CCP deployment.
-
-Usage (no arguments — runs all 4 consumer scenarios + publisher demo automatically):
-    python eventbus_demo.py
-
-Usage (single event — run one specific consumer scenario):
-    python eventbus_demo.py --account-id <uuid> --event-type ResourceDisabled
-    python eventbus_demo.py --account-id <uuid> --event-type ResourceActive
-    python eventbus_demo.py --account-id <uuid> --event-type ResourceDeleting
-    python eventbus_demo.py --account-id <uuid> --event-type ResourceDeleted
-
-Usage (live — calls real core/database, requires CCP deployment):
-    python eventbus_demo.py --account-id <uuid> --event-type ResourceDisabled --live
-
-Supported event types (short or full form both accepted):
-    ResourceDisabled   /  LifecycleEvent.ResourceDisabled
-    ResourceActive     /  LifecycleEvent.ResourceActive
-    ResourceDeleting   /  LifecycleEvent.ResourceDeleting
-    ResourceDeleted    /  LifecycleEvent.ResourceDeleted
-"""
-
-import argparse
-import datetime
-import json
 import logging
-import sys
 import uuid
-from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Callable, Optional, Union, Any, Dict
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Pretty logging
-# ──────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s  %(levelname)-8s  [%(name)s]  %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+from dataviz_core.adapters.account_client import AccountClient, Account
+from dataviz_core.utils import logname, update_resource_with
+from dataviz_core.models import Status
+from dataviz_core.models.workspace import Workspace
+from dataviz_core.models.account_details import AccountDetails
+from dataviz_core.services.interfaces import SessionProvider
+from dataviz_core.services.session import SessionManagerMixin
+from dataviz_core.repositories.context import RepositoryContext
+from dataviz_core.utils.logging import get_default_logger
+from dataviz_core.config.const import WORKSPACE_LIMIT_PER_ACCOUNT, ADMIN_ACCOUNTS
+from dataviz_core.services.filtering import FilteringCriterion
+from dataviz_core.errors.exceptions import (
+    AccountNotFoundException,
+    NotOwnerError,
+    AccountNotInActiveException,
 )
 
+LoggerType = Union[logging.Logger, logging.LoggerAdapter]
 
-def section(title: str) -> None:
-    """Print a visible section banner."""
-    bar = "═" * 72
-    print(f"\n╔{bar}╗")
-    print(f"║  {title:<70}║")
-    print(f"╚{bar}╝")
+# Statuses that mean an operation is already in progress
+_IN_PROGRESS_STATUSES = (Status.UPDATE_REQUESTED, Status.UPDATING)
 
+# Statuses from which deactivation is allowed
+_DEACTIVATABLE_STATUSES = (Status.ACTIVE, Status.FAILED)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 1 — MOCK DOMAIN MODELS
-# (stand-ins for dataviz_core models — zero real imports needed)
-# ══════════════════════════════════════════════════════════════════════════════
+# Statuses from which reactivation is allowed
+_REACTIVATABLE_STATUSES = (Status.INACTIVE, Status.FAILED)
 
-class Status(Enum):
-    CREATION_REQUESTED = "CREATION_REQUESTED"
-    CREATING           = "CREATING"
-    ACTIVE             = "ACTIVE"
-    UPDATE_REQUESTED   = "UPDATE_REQUESTED"
-    UPDATING           = "UPDATING"
-    INACTIVE           = "INACTIVE"
-    DELETION_REQUESTED = "DELETION_REQUESTED"
-    DELETING           = "DELETING"
-    DELETED            = "DELETED"
-    FAILED             = "FAILED"
+# Statuses from which deletion is allowed
+_DELETABLE_STATUSES = (Status.ACTIVE, Status.INACTIVE, Status.FAILED)
 
 
-class Workspace:
-    """Minimal workspace model."""
-    def __init__(self, name: str, owner_account_id: str, status: Status = Status.ACTIVE):
-        self.id               = uuid.uuid4()
-        self.name             = name
-        self.owner_account_id = owner_account_id
-        self.status           = status
-
-    def __repr__(self):
-        return f"Workspace(name={self.name!r}, status={self.status.value})"
-
-
-class AccountDetails:
-    """Minimal account-details model."""
-    def __init__(self, owner_account_id: str, status: Status = Status.ACTIVE):
-        self.id               = uuid.uuid4()
-        self.owner_account_id = owner_account_id
-        self.status           = status
-
-    def __repr__(self):
-        return f"AccountDetails(owner_id={self.owner_account_id!r}, status={self.status.value})"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 2 — MOCK EVENTBUS CLIENT LIBRARY
-# (stand-ins for event_bus_client + sg_cloud_event — zero real imports needed)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class LifecycleEvent:
-    """
-    Mirrors sg_cloud_event.LifecycleEvent.
-
-    Holds the three sections of a CloudEvent:
-      • headers    – CloudEvent 1.0 core attributes
-      • extensions – vendor-specific extension attributes
-      • data       – arbitrary event payload (HAL+JSON resource)
-    """
-    def __init__(self, headers: dict, extensions: dict, data: dict):
-        self.headers    = headers
-        self.extensions = extensions
-        self.data       = data
-        # Convenience accessors used by the consumer
-        self.type       = headers.get("type", "")
-
-    def to_dict(self) -> dict:
-        return {**self.headers, **self.extensions, "data": self.data}
-
-
-class CloudEventMessage:
-    """
-    Mirrors event_bus_client.CloudEventMessage.
-
-    The wire format that gets serialised and sent to the broker.
-    """
-    def __init__(self, payload: dict):
-        self._payload = payload
-
-    @classmethod
-    def build_from_event(cls, event: LifecycleEvent) -> "CloudEventMessage":
-        return cls(payload=event.to_dict())
-
-    def serialize(self) -> str:
-        return json.dumps(self._payload, indent=2)
-
-    def __repr__(self):
-        return f"CloudEventMessage(type={self._payload.get('type')!r})"
-
-
-# ─── Simulated AMQP broker (in-memory queue) ──────────────────────────────────
-
-_BROKER: List[CloudEventMessage] = []   # shared in-memory "topic"
-
-
-class Publisher:
-    """
-    Mirrors event_bus_client.Publisher.
-
-    publish() serialises the CloudEventMessage and drops it on the broker.
-    """
-    def __init__(self, client: Any, topic: str):
-        self._client = client
-        self._topic  = topic
-        self._log    = logging.getLogger("Publisher")
-
-    def publish(self, message: CloudEventMessage) -> None:
-        serialised = message.serialize()
-        self._log.info(
-            f"📤  PUBLISHING to topic '{self._topic}' "
-            f"(broker now has {len(_BROKER)+1} message(s))"
-        )
-        self._log.debug(f"Wire payload:\n{serialised}")
-        _BROKER.append(message)
-
-
-class Queue:
-    """
-    Mirrors event_bus_client.Queue.
-
-    Binds to the broker topic with specific routing keys.
-    """
-    def __init__(self, client: Any, alias: str, topic: str, routing_key: List[str]):
-        self.alias       = alias
-        self.topic       = topic
-        self.routing_key = routing_key
-        self._log        = logging.getLogger("Queue")
-        self._log.info(
-            f"Queue '{alias}' bound to topic '{topic}' "
-            f"with routing keys: {routing_key}"
-        )
-
-
-class Consumer:
-    """
-    Mirrors event_bus_client.Consumer.
-
-    In production this runs a blocking AMQP loop.
-    Here we drain the in-memory broker synchronously.
-    """
-    def __init__(self, queue: Queue, callback, dead_letter=None, auto_ack=True, timeout=10):
-        self._queue       = queue
-        self._callback    = callback
-        self._dead_letter = dead_letter
-        self._auto_ack    = auto_ack
-        self._log         = logging.getLogger("Consumer")
-
-    def drain(self) -> None:
-        """Consume all pending messages from the in-memory broker."""
-        self._log.info(f"📥  Consumer draining {len(_BROKER)} message(s) from broker …")
-        while _BROKER:
-            msg = _BROKER.pop(0)
-            event = LifecycleEvent(
-                headers    = msg._payload,
-                extensions = msg._payload,
-                data       = msg._payload.get("data", {}),
-            )
-            self._callback(event, msg)
-        self._log.info("Consumer: broker is now empty.")
-
-
-class Client:
-    """Stub for event_bus_client.Client (AMQP connection)."""
-    def __init__(self, user: str, password: str, region: str):
-        self.user   = user
-        self.region = region
-        logging.getLogger("Client").info(
-            f"Client connected  user={user!r}  region={region!r}"
-        )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 3 — EVENTBUS ADAPTER  (mirrors core/eventbus_adapter.py)
-# ══════════════════════════════════════════════════════════════════════════════
-
-STATUS_TO_LIFECYCLE_EVENT_TYPE = {
-    Status.CREATION_REQUESTED : "LifecycleEvent.ResourceCreating",
-    Status.CREATING           : "LifecycleEvent.ResourceCreating",
-    Status.ACTIVE             : "LifecycleEvent.ResourceReady",
-    Status.UPDATE_REQUESTED   : "LifecycleEvent.ResourceModifying",
-    Status.UPDATING           : "LifecycleEvent.ResourceModifying",
-    Status.DELETION_REQUESTED : "LifecycleEvent.ResourceDeleting",
-    Status.DELETING           : "LifecycleEvent.ResourceDeleting",
-    Status.DELETED            : "LifecycleEvent.ResourceDeleted",
-    Status.FAILED             : "LifecycleEvent.ResourceError",
-    Status.INACTIVE           : "LifecycleEvent.ResourceError",
-}
-
-
-def get_lifecycle_event_type(old_status: Status, new_status: Status) -> Optional[str]:
-    if new_status == Status.ACTIVE and old_status == Status.UPDATING:
-        return "LifecycleEvent.ResourceModified"
-    return STATUS_TO_LIFECYCLE_EVENT_TYPE.get(new_status)
-
-
-class EventBusAdapter:
-    """
-    Mirrors core/eventbus_adapter.py — EventBusAdapter.
-
-    Converts an internal status-change into a CloudEvent and publishes it.
-    """
-
-    def __init__(self, eventbus_account: Client, account_id: str, fqdn_source: str):
-        self.__account    = eventbus_account
-        self._account_id  = account_id
-        self._fqdn_source = fqdn_source
-        self.logger       = logging.getLogger("EventBusAdapter")
-
-    def send_status(
-        self,
-        resource_type: str,
-        resource_id: str,
-        old_status: Status,
-        new_status: Status,
-        data: Dict[str, Any],
-    ) -> None:
-        event_type = get_lifecycle_event_type(old_status, new_status)
-        if not event_type:
-            self.logger.warning(
-                f"No lifecycle event type for transition "
-                f"{old_status.value} → {new_status.value}. Skipping publish."
-            )
-            return
-
-        # ── CloudEvent 1.0 core attributes ────────────────────────────────────
-        headers = {
-            "specversion"     : "1.0",
-            "id"              : str(uuid.uuid4()),
-            "type"            : event_type,
-            "source"          : self._fqdn_source,
-            "time"            : datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "subject"         : resource_id,
-            "datacontenttype" : "application/hal+json",
-            "dataschema"      : "srn:sgcp:refdata:schema:schema-resource-json-1.0.0",
-        }
-        self.logger.info(f"CloudEvent headers : {headers}")
-
-        # ── CloudEvent extension attributes ───────────────────────────────────
-        extensions = {
-            "resourceowner"   : self._account_id,
-            "resourceservice" : self._fqdn_source,
-            "resourcetype"    : resource_type,
-            "resourcesubtype" : "None",
-        }
-        self.logger.info(f"CloudEvent extensions : {extensions}")
-        self.logger.info(f"CloudEvent data       : {data}")
-
-        # ── Build + publish ────────────────────────────────────────────────────
-        event   = LifecycleEvent(headers=headers, extensions=extensions, data=data)
-        message = CloudEventMessage.build_from_event(event)
-        self.logger.info(f"CloudEvent message built: {message}")
-
-        publisher = Publisher(client=self.__account, topic="lifecycle")
-        publisher.publish(message)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 4 — MOCK IN-MEMORY REPOSITORIES + WORKFLOW EXECUTOR
-# ══════════════════════════════════════════════════════════════════════════════
-
-class InMemoryAccountRepo:
-    """Dead-simple in-memory store for AccountDetails."""
-
-    def __init__(self):
-        self._store: Dict[str, AccountDetails] = {}
-
-    def save(self, account: AccountDetails) -> None:
-        self._store[account.owner_account_id] = account
-
-    def get(self, owner_account_id: str) -> Optional[AccountDetails]:
-        return self._store.get(str(owner_account_id))
-
-    def update_status(self, owner_account_id: str, status: Status) -> None:
-        acc = self._store.get(str(owner_account_id))
-        if acc:
-            acc.status = status
-
-
-class InMemoryWorkspaceRepo:
-    """Dead-simple in-memory store for Workspaces."""
-
-    def __init__(self):
-        self._store: List[Workspace] = []
-
-    def save(self, workspace: Workspace) -> None:
-        self._store.append(workspace)
-
-    def list_by_owner(
-        self,
-        owner_account_id: str,
-        status_filter: Optional[Status] = None,
-    ) -> List[Workspace]:
-        results = [w for w in self._store if w.owner_account_id == str(owner_account_id)]
-        if status_filter:
-            results = [w for w in results if w.status == status_filter]
-        return results
-
-    def update_status_for_owner(self, owner_account_id: str, status: Status) -> List[Workspace]:
-        updated = []
-        for w in self._store:
-            if w.owner_account_id == str(owner_account_id):
-                w.status = status
-                updated.append(w)
-        return updated
-
-
-class MockWorkflowExecutor:
-    """
-    Simulates the Celery async worker.
-
-    In production this sends a task to a Celery broker.
-    Here we execute it immediately (synchronously) for demo purposes.
-    """
-
-    def __init__(self, account_service_ref):
-        self._svc = account_service_ref
-        self._log = logging.getLogger("WorkflowExecutor")
-
-    def async_exec_core_function(self, service: str, function: str, kwargs: dict):
-        self._log.info(
-            f"⚙️  [CELERY TASK] Dispatching  {service}.{function}({kwargs})"
-        )
-        func = getattr(self._svc, function)
-        func(**kwargs)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 5 — MOCK ACCOUNT SERVICE  (mirrors core/accounts.py)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class MockAccountService:
-    """
-    Simplified AccountService that mirrors the real one.
-
-    Uses in-memory repos instead of SQLAlchemy.
-    The handle_event() router is identical to the production version.
-    """
+class AccountService(SessionManagerMixin):
 
     def __init__(
         self,
-        account_repo: InMemoryAccountRepo,
-        workspace_repo: InMemoryWorkspaceRepo,
-        eventbus_adapter: Optional[EventBusAdapter] = None,
-    ):
-        self._accounts   = account_repo
-        self._workspaces = workspace_repo
-        self._eventbus   = eventbus_adapter
-        self.workflow_executor = None          # injected after construction
-        self.logger      = logging.getLogger("AccountService")
+        account_client: AccountClient,
+        session_provider: SessionProvider,
+        repository_context: Optional[RepositoryContext] = None,
+        is_retrying_func: Callable[[], bool] = lambda: False,
+        logger: Optional[LoggerType] = None,
+        workflow_executor=None,
+    ) -> None:
 
-    # ── lifecycle event router ────────────────────────────────────────────────
+        super().__init__(
+            session_provider,
+            repository_context=repository_context,
+        )
+
+        self.is_retrying_func = is_retrying_func
+        self.account_client = account_client
+        self.logger = logger if logger else get_default_logger(__name__)
+        self.workspace_service = None
+        self.garbage_collector_service = None
+        self.workflow_executor = workflow_executor
+
+    def set_workspace_service(self, workspace_service):
+        """Inject workspace service to avoid circular dependency."""
+        self.workspace_service = workspace_service
+
+    def _update_account_with_and_return(
+        self,
+        account: AccountDetails,
+        **changes: Any,
+    ) -> AccountDetails:
+        if self._update_account_with(account, **changes):
+            return self.repositories.account_details.get_by_id(account.id)
+        return account
+
+    def _update_account_with(
+        self,
+        account: AccountDetails,
+        **changes: Any,
+    ) -> Dict[str, Any]:
+        return update_resource_with(
+            ctx_manager=self.autocommit(),
+            repository=self.repositories.account_details,
+            resource=account,
+            logger=self.logger,
+            **changes,
+        )
+
+    def _assert_not_in_progress(self, account: AccountDetails, owner_account_id: uuid.UUID) -> None:
+        """
+        Raise AccountNotInActiveException if an operation is already
+        in progress on this account. Prevents concurrent modifications.
+        """
+        if account.status in _IN_PROGRESS_STATUSES:
+            self.logger.warning(
+                f"Account {owner_account_id} is already in progress. "
+                + f"Current status: {account.status}"
+            )
+            raise AccountNotInActiveException(account.id)
+
+    def get_account_details_by_id(self, workspace: Workspace) -> Account:
+        """
+        Retrieves account details from the external platform client.
+        NOTE: This calls an external API, not the local Dataviz DB.
+        For local DB lookup use get_by_owner_id instead.
+        """
+        self.logger.info("Collecting account information")
+        return self.account_client.get_account_by_id(str(workspace.owner_account_id))
+
+    def get_by_owner_id(self, owner_account_id: str) -> AccountDetails:
+        """
+        Look up AccountDetails by owner_account_id in the local DB.
+        Raises AccountNotFoundException if not found.
+        """
+        filters = [FilteringCriterion("owner_account_id", owner_account_id)]
+        results = self.repositories.account_details.list(filters=filters)
+
+        if not results:
+            self.logger.error(
+                "AccountDetails not found for owner_account_id: " + f"{owner_account_id}"
+            )
+            raise AccountNotFoundException(
+                f"AccountDetails with owner_account_id: {owner_account_id} not found"
+            )
+
+        return results[0]
+
+    def get_soft_limit(self, owner_account_id: str):
+        """Retrieves the soft limit for the specified owner account."""
+
+        try:
+            account_obj: Optional[AccountDetails] = (
+                self.repositories.account_details.get_by_owner_account_id(owner_account_id)
+            )
+            if account_obj:
+                return account_obj.soft_limit
+        except Exception:
+            self.logger.info(
+                f"No existing account details found. Creating new for: {owner_account_id}"
+            )
+
+        account_details_from_client = self.account_client.get_account_by_id(str(owner_account_id))
+
+        if not account_details_from_client:
+            self.logger.warning(
+                "Account details not found from client for ID: " + f"{owner_account_id}"
+            )
+            raise AccountNotFoundException(f"Account details with id: {owner_account_id} not found")
+
+        account_details = AccountDetails(
+            name=account_details_from_client.name,
+            owner_account_id=account_details_from_client.id,
+            soft_limit=WORKSPACE_LIMIT_PER_ACCOUNT,
+        )
+
+        if self.autocommit():
+            self.repositories.account_details.insert(account_details)
+
+        return account_details.soft_limit
+
+    def request_account_deactivation(
+        self,
+        owner_account_id: uuid.UUID,
+        account_id: uuid.UUID,
+    ) -> AccountDetails:
+        """
+        Request deactivation of an account and all its active workspaces.
+
+        Allowed from: ACTIVE, FAILED (retry after failed deactivation)
+        Blocked if:   INACTIVE, DELETED, UPDATE_REQUESTED (in progress)
+
+        Flow:
+        - No active workspaces -> immediately INACTIVE
+        - Has active workspaces -> UPDATE_REQUESTED -> async -> INACTIVE
+        - On async failure -> FAILED
+        """
+
+        if str(account_id) not in ADMIN_ACCOUNTS:
+            raise NotOwnerError(account_id, "workspace", owner_account_id)
+
+        try:
+            account = self.get_by_owner_id(owner_account_id)
+        except Exception:
+            self.logger.error(f"Account with id: {owner_account_id} not found")
+            raise AccountNotFoundException(f"Account with id: {owner_account_id} not found")
+
+        # Block if already in progress
+        self._assert_not_in_progress(account, owner_account_id)
+
+        # Block if already INACTIVE or DELETED
+
+        if account.status is Status.INACTIVE:
+            self.logger.info(f"Account {owner_account_id} is already inactive.")
+            raise AccountNotInActiveException(account.id)
+
+        if account.status is Status.DELETED:
+            self.logger.info(f"Account {owner_account_id} is already deleted.")
+            raise AccountNotInActiveException(account.id)
+
+        # Allow ACTIVE and FAILED
+        if account.status not in _DEACTIVATABLE_STATUSES:
+            self.logger.info(
+                f"Account {owner_account_id} cannot be deactivated. "
+                + f"Current status: {account.status}"
+            )
+            raise AccountNotInActiveException(account.id)
+
+        # Only look for ACTIVE workspaces for deactivation
+        filters = [
+            FilteringCriterion("owner_account_id", owner_account_id),
+            FilteringCriterion("status", Status.ACTIVE),
+        ]
+        workspaces = self.repositories.workspace.list(filters=filters)
+
+        if len(workspaces) == 0:
+            self.logger.info(
+                "No active workspaces found for owner_account_id: " + f"{owner_account_id}"
+            )
+            return self._update_account_with_and_return(account, status=Status.INACTIVE)
+
+        self.logger.info(f"Requesting {logname(account)} deactivation")
+
+        # Set UPDATE_REQUESTED immediately so status endpoint shows progress
+        # deactivate_account (async) will set INACTIVE when all workspaces done
+        result = self._update_account_with_and_return(account, status=Status.UPDATE_REQUESTED)
+
+        self.workflow_executor.async_exec_core_function(
+            service="account",
+            function="deactivate_account",
+            kwargs={"owner_account_id": owner_account_id},
+        )
+
+        return result
+
+    def deactivate_account(self, owner_account_id: uuid.UUID) -> AccountDetails:
+        """
+        Async target: deactivates all workspaces then marks account INACTIVE.
+        Called by Celery worker. Sets FAILED if anything goes wrong.
+        """
+        try:
+            account = self.get_by_owner_id(owner_account_id)
+        except Exception:
+            self.logger.error(f"Account with id: {owner_account_id} not found")
+            raise AccountNotFoundException(f"Account with id: {owner_account_id} not found")
+
+        self.logger.info("All workspaces deactivation requested for " + f"{owner_account_id}")
+
+        try:
+            workspace_details = self.workspace_service.deactivate_workspaces_by_owner_account_id(
+                owner_account_id
+            )
+            self.logger.info(
+                f"Deactivation completed for {owner_account_id} | " + f"{workspace_details}"
+            )
+            return self._update_account_with_and_return(account, status=Status.INACTIVE)
+
+        except Exception as e:
+            self.logger.error(f"Deactivation failed for {owner_account_id}. Error: {e}")
+            self._update_account_with(account, status=Status.FAILED)
+            raise
+
+    def request_account_reactivation(
+        self,
+        owner_account_id: uuid.UUID,
+        account_id: uuid.UUID,
+    ) -> AccountDetails:
+        """
+        Request reactivation of an account and all its inactive workspaces.
+
+        Allowed from: INACTIVE, FAILED (retry after failed reactivation)
+        Blocked if:   ACTIVE, DELETED, UPDATE_REQUESTED (in progress)
+
+        Flow:
+        - No inactive workspaces -> immediately ACTIVE
+        - Has inactive workspaces -> UPDATE_REQUESTED -> async -> ACTIVE
+        - On async failure -> FAILED
+        """
+        if str(account_id) not in ADMIN_ACCOUNTS:
+            raise NotOwnerError(account_id, "workspace", owner_account_id)
+
+        try:
+            account = self.get_by_owner_id(owner_account_id)
+        except Exception:
+            raise AccountNotFoundException(f"Account with id: {owner_account_id} not found")
+
+        # Block if already in progress
+        self._assert_not_in_progress(account, owner_account_id)
+
+        # Block if already ACTIVE or DELETED
+        if account.status is Status.ACTIVE:
+            self.logger.info(f"Account {owner_account_id} is already active.")
+            raise AccountNotInActiveException(account.id)
+
+        if account.status is Status.DELETED:
+            self.logger.info(f"Account {owner_account_id} is already deleted.")
+            raise AccountNotInActiveException(account.id)
+
+        # Allow INACTIVE and FAILED
+        if account.status not in _REACTIVATABLE_STATUSES:
+            self.logger.info(
+                f"Account {owner_account_id} cannot be reactivated. "
+                + f"Current status: {account.status}"
+            )
+            raise AccountNotInActiveException(account.id)
+
+        # Only look for INACTIVE workspaces for reactivation
+        filters = [
+            FilteringCriterion("owner_account_id", owner_account_id),
+            FilteringCriterion("status", Status.INACTIVE),
+        ]
+        workspaces = self.repositories.workspace.list(filters=filters)
+
+        if len(workspaces) == 0:
+            self.logger.info(
+                f"No inactive workspaces found for owner_account_id: {owner_account_id}"
+            )
+            return self._update_account_with_and_return(account, status=Status.ACTIVE)
+
+        self.logger.info(f"Requesting {logname(account)} reactivation")
+
+        # Set UPDATE_REQUESTED immediately so status endpoint shows progress
+        # reactivate_account (async) will set ACTIVE when all workspaces done
+        result = self._update_account_with_and_return(account, status=Status.UPDATE_REQUESTED)
+
+        self.workflow_executor.async_exec_core_function(
+            service="account",
+            function="reactivate_account",
+            kwargs={"owner_account_id": owner_account_id},
+        )
+
+        return result
+
+    def reactivate_account(self, owner_account_id: uuid.UUID) -> AccountDetails:
+        """
+        Async target: reactivates all workspaces then marks account ACTIVE.
+        Called by Celery worker. Sets FAILED if anything goes wrong.
+        """
+        try:
+            account = self.get_by_owner_id(owner_account_id)
+        except Exception:
+            self.logger.error(f"Account with id: {owner_account_id} not found")
+            raise AccountNotFoundException(f"Account with id: {owner_account_id} not found")
+
+        try:
+            workspace_details = self.workspace_service.reactivate_workspaces_by_owner_account_id(
+                owner_account_id
+            )
+            self.logger.info(
+                f"Reactivation completed for {owner_account_id} | " + f"{workspace_details}"
+            )
+            return self._update_account_with_and_return(account, status=Status.ACTIVE)
+
+        except Exception as e:
+            self.logger.error(f"Reactivation failed for {owner_account_id}. Error: {e}")
+            self._update_account_with(account, status=Status.FAILED)
+            raise
+
+    def request_account_deletion(
+        self,
+        owner_account_id: uuid.UUID,
+        account_id: uuid.UUID,
+        ) -> AccountDetails:
+        """
+        Request deletion of an account and ALL its workspaces.
+
+        Allowed from: ACTIVE, INACTIVE, FAILED
+        Blocked if:   DELETED, UPDATE_REQUESTED (in progress)
+
+        Flow:
+        - No pending workspaces -> immediately DELETED
+        - Has workspaces -> async -> DELETED
+        - On async failure -> FAILED
+        """
+
+        if str(account_id) not in ADMIN_ACCOUNTS:
+            raise NotOwnerError(account_id, "workspace", owner_account_id)
+
+        account = self.get_by_owner_id(owner_account_id)
+
+        # Block if already in progress
+        self._assert_not_in_progress(account, owner_account_id)
+
+        # Block if already DELETED
+        if account.status is Status.DELETED:
+            self.logger.info(f"Account {owner_account_id} is already deleted.")
+            raise AccountNotInActiveException(account.id)
+
+        # Allow ACTIVE, INACTIVE, FAILED
+        if account.status not in _DELETABLE_STATUSES:
+            self.logger.info(
+                f"Account {owner_account_id} is in state {account.status} "
+                + "and cannot be deleted."
+            )
+            raise AccountNotInActiveException(account.id)
+
+        # Fetch ALL non-deleted workspaces
+        filters = [FilteringCriterion("owner_account_id", owner_account_id)]
+        all_workspaces = self.repositories.workspace.list(filters=filters)
+        pending_workspaces = [w for w in all_workspaces if w.status is not Status.DELETED]
+
+        if len(pending_workspaces) == 0:
+            self.logger.info(
+                "No workspaces to delete for owner_account_id: " + f"{owner_account_id}"
+            )
+            return self._update_account_with_and_return(account, status=Status.DELETED)
+
+        self.logger.info(
+            f"Requesting {logname(account)} deletion - "
+            + f"{len(pending_workspaces)} workspace(s) to delete"
+        )
+
+        self.workflow_executor.async_exec_core_function(
+            service="account",
+            function="delete_account",
+            kwargs={"owner_account_id": owner_account_id},
+        )
+
+        return self._update_account_with_and_return(account, status=Status.DELETED)
+
+    def delete_account(self, owner_account_id: uuid.UUID) -> AccountDetails:
+        """
+        Async target: deletes all workspaces then marks account DELETED.
+        Called by Celery worker. Sets FAILED if anything goes wrong.
+        """
+        try:
+            account = self.get_by_owner_id(owner_account_id)
+        except Exception:
+            self.logger.error(f"Account with id: {owner_account_id} not found")
+            raise AccountNotFoundException(f"Account with id: {owner_account_id} not found")
+
+        try:
+            workspace_details = self.workspace_service.delete_workspaces_by_owner_account_id(
+                owner_account_id
+            )
+            self.logger.info(
+                f"Deletion completed for {owner_account_id} | " + f"{workspace_details}"
+            )
+            return self._update_account_with_and_return(account, status=Status.DELETED)
+
+        except Exception as e:
+            self.logger.error(f"Deletion failed for {owner_account_id}. Error: {e}")
+            self._update_account_with(account, status=Status.FAILED)
+            raise
+
+    def set_garbage_collector_service(self, garbage_collector_service):
+        """Inject garbage collector service for grace period tracking."""
+        self.garbage_collector_service = garbage_collector_service
+
+    def set_workflow_executor(self, workflow_executor):
+        """Inject workflow executor for async Celery tasks."""
+        self.workflow_executor = workflow_executor
+
+    # -------------------------------------------------------------------------
+    # Lifecycle Event Handlers (moved from AccountLifecycleConsumer)
+    # -------------------------------------------------------------------------
+
+    def handle_resource_disabled(
+        self,
+        account_id: uuid.UUID,
+        event_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Handle LifecycleEvent.ResourceDisabled from Accounts Team.
+
+        When Accounts Team deactivates an account (starts grace period),
+        they publish this event. We:
+        1. Set deletion date via garbage collector (for grace period tracking)
+        2. Trigger async deactivation of all active workspaces
+        3. Update account status to INACTIVE
+
+        Args:
+            account_id: The account UUID
+            event_data: Optional additional data from the event
+        """
+        try:
+            self.logger.info(
+                "AccountService: Received ResourceDisabled event for account "
+                + f"{account_id} (grace period starts)"
+            )
+
+            try:
+                account = self.get_by_owner_id(account_id)
+            except AccountNotFoundException:
+                self.logger.warning(
+                    f"AccountService: Account {account_id} not found. "
+                    + "Skipping ResourceDisabled event."
+                )
+                return
+
+            if account.status == Status.INACTIVE:
+                self.logger.info(
+                    f"AccountService: Account {account_id} already INACTIVE. No action needed."
+                )
+                return
+
+            if account.status == Status.DELETED:
+                self.logger.info(f"AccountService: Account {account_id} already DELETED. Skipping.")
+                return
+
+            filters = [
+                FilteringCriterion("owner_account_id", account_id),
+                FilteringCriterion("status", Status.ACTIVE),
+            ]
+            active_workspaces = self.repositories.workspace.list(filters=filters)
+
+            if len(active_workspaces) == 0:
+                self.logger.info(
+                    f"AccountService: No active workspaces for {account_id}. "
+                    + "Setting INACTIVE immediately."
+                )
+                self._update_account_with(account, status=Status.INACTIVE)
+                self.logger.info(f"AccountService: Account {account_id} set to INACTIVE")
+                return
+
+            if self.garbage_collector_service is not None:
+                grace_period_days = getattr(account, "grace_period_days", 30)
+                self.logger.info(
+                    f"AccountService: Setting deletion date for {account_id} "
+                    + f"(grace period: {grace_period_days} days)"
+                )
+                self.garbage_collector_service.set_deletion_date_for_account(
+                    account=account,
+                    grace_period_days=grace_period_days,
+                )
+            else:
+                self.logger.warning(
+                    "AccountService: garbage_collector_service not set - "
+                    + f"skipping deletion date for {account_id}"
+                )
+
+            self._update_account_with(account, status=Status.UPDATE_REQUESTED)
+
+            if self.workflow_executor is not None:
+                self.logger.info(
+                    "AccountService: Triggering async deactivation of "
+                    + f"{len(active_workspaces)} workspace(s) for {account_id}"
+                    )
+                self.workflow_executor.async_exec_core_function(
+                    service="account",
+                    function="deactivate_account",
+                    kwargs={"owner_account_id": account_id},
+                )
+            else:
+                self.logger.error(
+                    "AccountService: workflow_executor not set - cannot trigger async "
+                    + f"deactivation for {account_id}"
+                )
+
+            self.logger.info(
+                f"AccountService: Account {account_id} deactivation "
+                + "started (status: UPDATE_REQUESTED -> async task will set INACTIVE)"
+            )
+
+        except Exception as e:
+            self.logger.error(
+                f"AccountService: Failed to handle ResourceDisabled for account {account_id}: {e}",
+                exc_info=True,
+            )
+            raise
+
+    def handle_resource_active(
+        self,
+        account_id: uuid.UUID,
+        event_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Handle LifecycleEvent.ResourceActive from Accounts Team.
+
+        When Accounts Team reactivates an account during grace period,
+        they publish this event. We:
+        1. Cancel the deletion date (grace period cancelled)
+        2. Trigger async reactivation of all inactive workspaces
+        3. Update account status to ACTIVE
+
+        Args:
+            account_id: The account UUID
+            event_data: Optional additional data from the event
+        """
+        try:
+            self.logger.info(
+                "AccountService: Received ResourceActive event for account "
+                + f"{account_id} (reactivation, grace period cancelled)"
+            )
+
+            try:
+                account = self.get_by_owner_id(account_id)
+            except AccountNotFoundException:
+                self.logger.warning(
+                    f"AccountService: Account {account_id} not found. "
+                    + "Skipping ResourceActive event."
+                )
+                return
+
+            if account.status == Status.ACTIVE:
+                self.logger.info(
+                    f"AccountService: Account {account_id} " + "already ACTIVE. No action needed."
+                )
+                return
+
+            if account.status == Status.DELETED:
+                self.logger.warning(
+                    f"AccountService: Account {account_id} " + "is DELETED. Cannot reactivate."
+                )
+                return
+
+            filters = [
+                FilteringCriterion("owner_account_id", account_id),
+                FilteringCriterion("status", Status.INACTIVE),
+            ]
+            inactive_workspaces = self.repositories.workspace.list(filters=filters)
+
+            if len(inactive_workspaces) == 0:
+                self.logger.info(
+                    f"AccountService: No inactive workspaces for {account_id}. "
+                    + "Setting ACTIVE immediately."
+                )
+                self._update_account_with(account, status=Status.ACTIVE)
+                self.logger.info(f"AccountService: Account {account_id} set to ACTIVE")
+                return
+
+            self._update_account_with(account, status=Status.UPDATE_REQUESTED)
+
+            if self.workflow_executor is not None:
+                self.logger.info(
+                    "AccountService: Triggering async reactivation of "
+                    + f"{len(inactive_workspaces)} workspace(s) for {account_id}"
+                )
+                self.workflow_executor.async_exec_core_function(
+                    service="account",
+                    function="reactivate_account",
+                    kwargs={"owner_account_id": account_id},
+                )
+            else:
+                self.logger.error(
+                    "AccountService: workflow_executor not set - cannot trigger async "
+                    + f"reactivation for {account_id}"
+                )
+
+            self.logger.info(
+                f"AccountService: Account {account_id} reactivation started "
+                + "(status: UPDATE_REQUESTED -> async task will set ACTIVE)"
+            )
+
+        except Exception as e:
+            self.logger.error(
+                f"AccountService: Failed to handle ResourceActive for account {account_id}: {e}",
+                exc_info=True,
+            )
+            raise
+
+    def handle_resource_deleting(
+        self,
+        account_id: uuid.UUID,
+        event_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Handle LifecycleEvent.ResourceDeleting from Accounts Team.
+
+        When Accounts Team permanently deletes an account (after grace period),
+        they publish this event. We:
+        1. Trigger async deletion of all workspaces
+        2. Update account status to DELETED
+
+        Args:
+            account_id: The account UUID
+            event_data: Optional additional data from the event
+        """
+        try:
+            self.logger.info(
+                "AccountService: Received ResourceDeleting event for account "
+                + f"{account_id} (pending deletion)"
+            )
+
+            account = self.repositories.account_details.get(owner_account_id=account_id)
+
+            if not account:
+                self.logger.warning(
+                    f"AccountService: Account {account_id} not found. "
+                    + "Skipping ResourceDeleting event."
+                )
+                return
+
+            if account.status == Status.DELETED:
+                self.logger.info(
+                    f"AccountService: Account {account_id} " + "already DELETED. No action needed."
+                )
+                return
+
+            filters = [FilteringCriterion("owner_account_id", account_id)]
+            all_workspaces = self.repositories.workspace.list(filters=filters)
+            pending_workspaces = [w for w in all_workspaces if w.status != Status.DELETED]
+
+            if len(pending_workspaces) == 0:
+                self.logger.info(
+                    f"AccountService: No workspaces to delete for {account_id}. "
+                    + "Marking account as DELETED."
+                )
+                with self.autocommit():
+                    self.repositories.account_details.update(
+                        id=account.id,
+                        status=Status.DELETED,
+                    )
+                self.logger.info(f"AccountService: Account {account_id} set to DELETED")
+                return
+
+            if self.workflow_executor is not None:
+                self.logger.info("AccountService: Triggering async deletion of "
+                    + f"{len(pending_workspaces)} workspace(s) for {account_id}"
+                )
+                self.workflow_executor.async_exec_core_function(
+                    service="account",
+                    function="delete_account",
+                    kwargs={"owner_account_id": account_id},
+                )
+                with self.autocommit():
+                    self.repositories.account_details.update(
+                        id=account.id,
+                        status=Status.DELETED,
+                    )
+                return
+
+            if self.workspace_service is not None:
+                self.logger.info(
+                    "AccountService: Using workspace_service to delete "
+                    + f"{len(pending_workspaces)} workspace(s) for {account_id}"
+                )
+                self.workspace_service.delete_workspaces_by_owner_account_id(
+                    account.owner_account_id
+                )
+                with self.autocommit():
+                    self.repositories.account_details.update(
+                        id=account.id,
+                        status=Status.DELETED,
+                    )
+                return
+
+            raise RuntimeError(
+                f"AccountService: Cannot delete workspaces for {account_id} - "
+                + "no workflow_executor or workspace_service available"
+            )
+
+        except Exception as e:
+            self.logger.error(
+                f"AccountService: Failed to handle ResourceDeleting for account {account_id}: {e}",
+                exc_info=True,
+            )
+            raise
+
+    def handle_resource_deleted(
+        self,
+        account_id: uuid.UUID,
+        event_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Handle LifecycleEvent.ResourceDeleted from Accounts Team.
+
+        When Accounts Team confirms account deletion is complete,
+        they publish this event. We:
+        1. Verify all workspaces are deleted
+        2. If resources remain, send notification email to Dataviz team
+
+        Args:
+            account_id: The account UUID
+            event_data: Optional additional data from the event
+        """
+        try:
+            self.logger.info(
+                "AccountService: Received ResourceDeleted event for account "
+                + f"{account_id} (deletion verification)"
+            )
+
+            account = self.repositories.account_details.get(owner_account_id=account_id)
+
+            if not account:
+                self.logger.warning(
+                    f"AccountService: Account {account_id} not found in DB. "
+                    + "Skipping ResourceDeleted event."
+                )
+                return
+
+            # Check for remaining resources
+            filters = [FilteringCriterion("owner_account_id", account_id)]
+            all_workspaces = self.repositories.workspace.list(filters=filters)
+            remaining_workspaces = [w for w in all_workspaces if w.status != Status.DELETED]
+
+            if len(remaining_workspaces) == 0:
+                self.logger.info(
+                    f"AccountService: Account {account_id} deletion verified - "
+                    + "no remaining resources."
+                )
+                return
+
+            # Resources still exist - send notification to Dataviz team
+            self.logger.error(
+                f"AccountService: Account {account_id} marked DELETED but "
+                + f"{len(remaining_workspaces)} workspace(s) remain: "
+                + f"{[w.id for w in remaining_workspaces]}"
+            )
+
+            # Compose notification email
+            workspace_details = "\n".join(
+                [
+                    f"  - Workspace ID: {w.id}, Name: {w.name}, Status: {w.status}"
+                    for w in remaining_workspaces
+                ]
+            )
+
+            email_subject = f"Manual Cleanup Required: Account {account_id}"
+            email_body = (
+                f"Account {account_id} has been marked as DELETED by Accounts Team, "
+                + f"but {len(remaining_workspaces)} workspace(s) could not be deleted "
+                + "automatically.\n\n"
+                + "Remaining workspaces:\n"
+                + workspace_details
+                + "\n\nPlease investigate and manually clean up these resources."
+            )
+
+            # Send notification if monitoring service available
+            if hasattr(self, "monitoring_service") and self.monitoring_service is not None:
+                try:
+                    self.monitoring_service.send_notification(
+                        error_level="ERROR",
+                        email_subject=email_subject,
+                        email_body=email_body,
+                    )
+                    self.logger.info(
+                        f"AccountService: Sent notification email for account {account_id}"
+                    )
+                except Exception as e:
+                    self.logger.error(
+                        f"AccountService: Failed to send notification email: {e}",
+                        exc_info=True,
+                    )
+            else:
+                self.logger.warning(
+                    "AccountService: monitoring_service not available - "
+                    + f"cannot send notification for {account_id}"
+                )
+
+        except Exception as e:
+            self.logger.error(
+                f"AccountService: Failed to handle ResourceDeleted for account {account_id}: {e}",
+                exc_info=True,
+            )
+            raise
+    def _refresh_workspace(self, workspace_id: uuid.UUID) -> Workspace:
+        workspace = self.repositories.workspace.get_by_id(workspace_id)
+        self.logger.info(f"Refreshing {logname(workspace)}...")
+
+        if workspace.status in [
+            Status.CREATION_REQUESTED,
+            Status.DELETION_REQUESTED,
+            Status.DELETED,
+        ]:
+            self.logger.info(
+                f"{logname(workspace)} status not changed: {workspace.status}"
+            )
+            return workspace
+
+        if workspace.dns is not None:
+            self._dns._refresh_dns(workspace.dns)
+        else:
+            raise NotFoundError("Workspace", "DNS")
+
+        if workspace.dataplane_component is not None:
+            self._dataplane._refresh_component(workspace.dataplane_component)
+        else:
+            raise NotFoundError("Workspace", "Dataplane")
+
+        # if workspace.kube_stack is not None:
+        #     self._kube_service._refresh_stack(workspace.kube_stack)
+
+        flatten_status = set(
+            [
+                workspace.dns.status,
+                workspace.dataplane_component.status,
+                # workspace.kube_stack.status,
+            ]
+        )
+
+        return self._update_workspace_with_and_return(
+            workspace,
+            status=self.status_from_dependencies(
+                Status(workspace.status),
+                flatten_status,
+            ),  # FIXME: typing issue here
+        )
 
     def handle_event(
         self,
         event_type: str,
-        account_id: str,
-        event_data: Optional[dict] = None,
-    ) -> dict:
+        account_id: uuid.UUID,
+        event_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """
-        Route an incoming lifecycle event to the correct handler.
-        Mirrors core/accounts.py AccountService.handle_event().
+        Route incoming account lifecycle events to handler methods.
+
+        Args:
+            event_type: The type of lifecycle event
+            account_id: The account UUID
+            event_data: Optional additional data from the event
         """
         handlers = {
-            "LifecycleEvent.ResourceDisabled": self._handle_resource_disabled,
-            "ResourceDisabled"               : self._handle_resource_disabled,
-            "LifecycleEvent.ResourceActive"  : self._handle_resource_active,
-            "ResourceActive"                 : self._handle_resource_active,
-            "LifecycleEvent.ResourceDeleting": self._handle_resource_deleting,
-            "ResourceDeleting"               : self._handle_resource_deleting,
-            "LifecycleEvent.ResourceDeleted" : self._handle_resource_deleted,
-            "ResourceDeleted"                : self._handle_resource_deleted,
+            "LifecycleEvent.ResourceDisabled": self.handle_resource_disabled,
+            "ResourceDisabled": self.handle_resource_disabled,
+            "LifecycleEvent.ResourceActive": self.handle_resource_active,
+            "ResourceActive": self.handle_resource_active,
+            "LifecycleEvent.ResourceDeleting": self.handle_resource_deleting,
+            "ResourceDeleting": self.handle_resource_deleting,
+            "LifecycleEvent.ResourceDeleted": self.handle_resource_deleted,
+            "ResourceDeleted": self.handle_resource_deleted,
         }
+
         handler = handlers.get(event_type)
         if handler is None:
-            self.logger.warning(f"Unknown event type '{event_type}' — ignoring.")
-            return {"success": False, "message": f"Unknown event type: {event_type}"}
-
-        self.logger.info(f"🔀  Routing '{event_type}'  →  {handler.__name__}()")
-        try:
-            handler(account_id=account_id, event_data=event_data or {})
-            return {"success": True, "message": f"{event_type} handled OK"}
-        except Exception as exc:
-            self.logger.error(f"Handler failed: {exc}", exc_info=True)
-            return {"success": False, "message": str(exc)}
-
-    # ── individual handlers ───────────────────────────────────────────────────
-
-    def _handle_resource_disabled(self, account_id: str, event_data: dict) -> None:
-        """
-        LifecycleEvent.ResourceDisabled
-        → Accounts Team has started the grace period for this account.
-        → We deactivate all ACTIVE workspaces.
-        """
-        self.logger.info(
-            f"  [ResourceDisabled] Account {account_id} — grace period starts. "
-            "Deactivating workspaces …"
-        )
-        account = self._accounts.get(account_id)
-        if not account:
-            self.logger.warning(f"  Account {account_id} not found — skipping.")
-            return
-
-        if account.status == Status.INACTIVE:
-            self.logger.info("  Account already INACTIVE — nothing to do.")
-            return
-
-        active_ws = self._workspaces.list_by_owner(account_id, status_filter=Status.ACTIVE)
-        if not active_ws:
-            self.logger.info("  No active workspaces — setting account INACTIVE immediately.")
-            self._accounts.update_status(account_id, Status.INACTIVE)
-            return
-
-        self.logger.info(f"  Found {len(active_ws)} active workspace(s) — scheduling async task.")
-        self._accounts.update_status(account_id, Status.UPDATE_REQUESTED)
-
-        if self.workflow_executor:
-            self.workflow_executor.async_exec_core_function(
-                service="account",
-                function="deactivate_account",
-                kwargs={"owner_account_id": account_id},
-            )
-
-    def deactivate_account(self, owner_account_id: str) -> None:
-        """Called by async worker — deactivates all ACTIVE workspaces."""
-        self.logger.info(f"  [async] deactivate_account({owner_account_id})")
-        updated = self._workspaces.update_status_for_owner(
-            owner_account_id, Status.INACTIVE
-        )
-        self.logger.info(f"  Deactivated {len(updated)} workspace(s): {[w.name for w in updated]}")
-        self._accounts.update_status(owner_account_id, Status.INACTIVE)
-        self.logger.info(f"  Account {owner_account_id} → INACTIVE ✓")
-
-    def _handle_resource_active(self, account_id: str, event_data: dict) -> None:
-        """
-        LifecycleEvent.ResourceActive
-        → Accounts Team cancelled the grace period — reactivate.
-        → We reactivate all INACTIVE workspaces.
-        """
-        self.logger.info(
-            f"  [ResourceActive] Account {account_id} — grace period cancelled. "
-            "Reactivating workspaces …"
-        )
-        account = self._accounts.get(account_id)
-        if not account:
-            self.logger.warning(f"  Account {account_id} not found — skipping.")
-            return
-
-        if account.status == Status.ACTIVE:
-            self.logger.info("  Account already ACTIVE — nothing to do.")
-            return
-
-        inactive_ws = self._workspaces.list_by_owner(account_id, status_filter=Status.INACTIVE)
-        if not inactive_ws:
-            self.logger.info("  No inactive workspaces — setting account ACTIVE immediately.")
-            self._accounts.update_status(account_id, Status.ACTIVE)
-            return
-
-        self.logger.info(f"  Found {len(inactive_ws)} inactive workspace(s) — scheduling async task.")
-        self._accounts.update_status(account_id, Status.UPDATE_REQUESTED)
-
-        if self.workflow_executor:
-            self.workflow_executor.async_exec_core_function(
-                service="account",
-                function="reactivate_account",
-                kwargs={"owner_account_id": account_id},
-            )
-
-    def reactivate_account(self, owner_account_id: str) -> None:
-        """Called by async worker — reactivates all INACTIVE workspaces."""
-        self.logger.info(f"  [async] reactivate_account({owner_account_id})")
-        updated = self._workspaces.update_status_for_owner(
-            owner_account_id, Status.ACTIVE
-        )
-        self.logger.info(f"  Reactivated {len(updated)} workspace(s): {[w.name for w in updated]}")
-        self._accounts.update_status(owner_account_id, Status.ACTIVE)
-        self.logger.info(f"  Account {owner_account_id} → ACTIVE ✓")
-
-    def _handle_resource_deleting(self, account_id: str, event_data: dict) -> None:
-        """
-        LifecycleEvent.ResourceDeleting
-        → Accounts Team is permanently deleting the account (grace period over).
-        → We delete ALL workspaces.
-        """
-        self.logger.info(
-            f"  [ResourceDeleting] Account {account_id} — permanent deletion triggered."
-        )
-        account = self._accounts.get(account_id)
-        if not account:
-            self.logger.warning(f"  Account {account_id} not found — skipping.")
-            return
-
-        if account.status == Status.DELETED:
-            self.logger.info("  Account already DELETED — nothing to do.")
-            return
-
-        pending_ws = [
-            w for w in self._workspaces.list_by_owner(account_id)
-            if w.status != Status.DELETED
-        ]
-        if not pending_ws:
-            self.logger.info("  No pending workspaces — marking account DELETED immediately.")
-            self._accounts.update_status(account_id, Status.DELETED)
-            return
-
-        self.logger.info(f"  Found {len(pending_ws)} workspace(s) to delete — scheduling async task.")
-        if self.workflow_executor:
-            self.workflow_executor.async_exec_core_function(
-                service="account",
-                function="delete_account",
-                kwargs={"owner_account_id": account_id},
-            )
-
-    def delete_account(self, owner_account_id: str) -> None:
-        """Called by async worker — deletes all workspaces."""
-        self.logger.info(f"  [async] delete_account({owner_account_id})")
-        updated = self._workspaces.update_status_for_owner(
-            owner_account_id, Status.DELETED
-        )
-        self.logger.info(f"  Deleted {len(updated)} workspace(s): {[w.name for w in updated]}")
-        self._accounts.update_status(owner_account_id, Status.DELETED)
-        self.logger.info(f"  Account {owner_account_id} → DELETED ✓")
-
-    def _handle_resource_deleted(self, account_id: str, event_data: dict) -> None:
-        """
-        LifecycleEvent.ResourceDeleted
-        → Accounts Team confirms deletion is complete.
-        → We verify no residual workspaces remain.
-        → If residuals exist, we alert (normally sends an email).
-        """
-        self.logger.info(
-            f"  [ResourceDeleted] Account {account_id} — final cleanup verification."
-        )
-        account = self._accounts.get(account_id)
-        if not account:
-            self.logger.warning(f"  Account {account_id} not found in DB — skipping.")
-            return
-
-        remaining = [
-            w for w in self._workspaces.list_by_owner(account_id)
-            if w.status != Status.DELETED
-        ]
-        if not remaining:
-            self.logger.info(
-                f"  ✅  Account {account_id}: all resources cleaned up — no action needed."
+            self.logger.warning(
+                f"AccountService: Unknown event type '{event_type}' for "
+                + f"account {account_id}. Ignoring."
             )
             return
 
-        # Residual resources — send alert
-        self.logger.error(
-            f"  ❌  Account {account_id}: {len(remaining)} workspace(s) NOT yet deleted!"
-        )
-        for w in remaining:
-            self.logger.error(f"       Residual: {w}")
-        self.logger.error(
-            "  📧  [ALERT] Notification email would be sent to Dataviz team for manual cleanup."
-        )
-
-    # ── helper for inspecting state ───────────────────────────────────────────
-
-    def print_state(self, account_id: str) -> None:
-        acc = self._accounts.get(account_id)
-        ws_list = self._workspaces.list_by_owner(account_id)
-        print(f"\n  {'─'*60}")
-        print(f"  Account  : {account_id}")
-        print(f"  Status   : {acc.status.value if acc else 'NOT FOUND'}")
-        print(f"  Workspaces ({len(ws_list)}):")
-        for w in ws_list:
-            print(f"    • {w.name:<30} status={w.status.value}")
-        print(f"  {'─'*60}\n")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 6 — CONSUMER CALLBACK FACTORY  (mirrors async/app.py)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def build_consumer_callback(account_service: MockAccountService):
-    """
-    Mirrors _create_lifecycle_event_handler() in async/app.py.
-
-    Returns the callback that the Consumer calls for every received message.
-    """
-    log = logging.getLogger("ConsumerCallback")
-
-    def on_lifecycle_event(event: LifecycleEvent, message: CloudEventMessage) -> None:
-        # ── Extract fields ────────────────────────────────────────────────────
-        event_type = getattr(event, "type", "") or event.headers.get("type", "")
-        account_id = (
-            event.headers.get("subject")
-            or event.extensions.get("resourceowner")
-            or event.data.get("resource", {}).get("id")
-        )
-
-        if not account_id:
-            log.warning(f"  Received event with no account_id — dropping: {event_type}")
-            return
-
-        log.info(f"\n  ┌─ Received message ──────────────────────────────────────")
-        log.info(f"  │  type       : {event_type}")
-        log.info(f"  │  account_id : {account_id}")
-        log.info(f"  │  source     : {event.headers.get('source')}")
-        log.info(f"  │  time       : {event.headers.get('time')}")
-        log.info(f"  └─────────────────────────────────────────────────────────")
-
-        result = account_service.handle_event(
-            event_type=event_type,
-            account_id=account_id,
-            event_data=event.data,
-        )
-
-        if result["success"]:
-            log.info(f"  ✅  handle_event → {result['message']}")
-        else:
-            log.error(f"  ❌  handle_event failed → {result['message']}")
-
-    return on_lifecycle_event
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 7 — FULL END-TO-END DEMO SCENARIOS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def demo_publisher_side(adapter: EventBusAdapter, account_id: str) -> None:
-    """
-    PUBLISHER SIDE
-    ─────────────
-    Simulates Dataviz publishing outgoing lifecycle events when a Workspace
-    changes state (e.g. after being provisioned → ACTIVE).
-
-    Maps to: EventBusAdapter.send_status() in core/eventbus_adapter.py
-    """
-    section("PUBLISHER SIDE — Dataviz publishes outgoing Workspace lifecycle events")
-
-    workspace_id = str(uuid.uuid4())
-    print(f"  Workspace ID : {workspace_id}")
-
-    transitions = [
-        (None,             Status.CREATION_REQUESTED, {"resource": {"id": workspace_id, "status": "CREATION_REQUESTED"}}),
-        (Status.CREATION_REQUESTED, Status.CREATING,  {"resource": {"id": workspace_id, "status": "CREATING"}}),
-        (Status.CREATING,  Status.ACTIVE,              {"resource": {"id": workspace_id, "status": "ACTIVE"}}),
-        (Status.ACTIVE,    Status.UPDATING,            {"resource": {"id": workspace_id, "status": "UPDATING"}}),
-        (Status.UPDATING,  Status.ACTIVE,              {"resource": {"id": workspace_id, "status": "ACTIVE"}}),
-        (Status.ACTIVE,    Status.DELETED,             {"resource": {"id": workspace_id, "status": "DELETED"}}),
-    ]
-
-    for old, new, data in transitions:
-        event_type = get_lifecycle_event_type(old, new) if old else STATUS_TO_LIFECYCLE_EVENT_TYPE.get(new)
-        print(f"\n  ── Transition: {(old.value if old else 'START'):<22} → {new.value:<22}"
-              f"  publishes: {event_type}")
-        adapter.send_status(
-            resource_type="workspace",
-            resource_id=workspace_id,
-            old_status=old or new,
-            new_status=new,
-            data=data,
-        )
-
-    print(f"\n  Broker now contains {len(_BROKER)} message(s) from publisher demo.\n")
-
-
-def demo_consumer_scenario(
-    title: str,
-    event_type: str,
-    account_id: str,
-    account_service: MockAccountService,
-    consumer: Consumer,
-    source_fqdn: str,
-) -> None:
-    """
-    CONSUMER SIDE — run one scenario.
-
-    1. Crafts a CloudEvent that the Accounts Team EventBus would send us.
-    2. Places it on the in-memory broker.
-    3. Consumer drains the broker (calls our callback).
-    4. AccountService handles the event and mutates workspace/account state.
-    """
-    section(f"CONSUMER SIDE — Scenario: {title}")
-
-    # Build the incoming CloudEvent (as the Accounts Team would publish it)
-    event_dict = {
-        # CloudEvent 1.0 core attributes (matches example.json)
-        "specversion"     : "1.0",
-        "id"              : str(uuid.uuid4()),
-        "time"            : datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "type"            : event_type,
-        "source"          : source_fqdn,
-        "subject"         : account_id,           # ← primary account ID source
-        "datacontenttype" : "application/hal+json",
-        "dataschema"      : "srn:sgcp:refdata:schema:schema-resource-json-1.0.0",
-        # CloudEvent extension attributes
-        "resourceowner"   : account_id,
-        "resourceservice" : source_fqdn,
-        "resourcetype"    : "account",
-        "resourcesubtype" : "",
-        # Event payload
-        "data": {
-            "resource": {
-                "id"              : account_id,
-                "owner_account_id": account_id,
-                "status"          : event_type.split(".")[-1],
-            }
-        },
-    }
-
-    print(f"\n  Incoming CloudEvent from Accounts Team EventBus:")
-    print("  " + json.dumps(event_dict, indent=4).replace("\n", "\n  "))
-
-    # Drop onto broker as if it arrived via AMQP
-    _BROKER.append(CloudEventMessage(event_dict))
-
-    print(f"\n  State BEFORE consuming:")
-    account_service.print_state(account_id)
-
-    # Consumer picks it up
-    consumer.drain()
-
-    print(f"\n  State AFTER consuming:")
-    account_service.print_state(account_id)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN — wire everything together and run the demo
-# ══════════════════════════════════════════════════════════════════════════════
-
-def main() -> None:
-    section("SETUP — wiring EventBus, Publisher, Consumer, AccountService")
-
-    # ── Fixed demo IDs ────────────────────────────────────────────────────────
-    ACCOUNT_ID  = "79fadc0d-90d9-45fe-9ab9-bbfbc4a2a28a"    # from example.json
-    FQDN_SOURCE = "ocs-uat.eu-fr-paris.cloud.socgen"         # from example.json
-    REGION      = "eu-fr-paris"
-
-    # ── EventBus client (AMQP connection) ─────────────────────────────────────
-    eb_client = Client(user="svc-dataviz", password="s3cr3t", region=REGION)
-
-    # ── EventBusAdapter (publisher side) ──────────────────────────────────────
-    adapter = EventBusAdapter(
-        eventbus_account=eb_client,
-        account_id=ACCOUNT_ID,
-        fqdn_source=FQDN_SOURCE,
-    )
-
-    # ── In-memory repos + account service ────────────────────────────────────
-    account_repo   = InMemoryAccountRepo()
-    workspace_repo = InMemoryWorkspaceRepo()
-
-    account_service = MockAccountService(
-        account_repo=account_repo,
-        workspace_repo=workspace_repo,
-        eventbus_adapter=adapter,
-    )
-
-    # ── Inject mock workflow executor (mirrors Celery async tasks) ────────────
-    executor = MockWorkflowExecutor(account_service_ref=account_service)
-    account_service.workflow_executor = executor
-
-    # ── Consumer (subscriber side) ────────────────────────────────────────────
-    queue = Queue(
-        client=eb_client,
-        alias="dataviz-lifecycle-consumer",
-        topic="lifecycle",
-        routing_key=[
-            "LifecycleEvent.ResourceDisabled",
-            "LifecycleEvent.ResourceActive",
-            "LifecycleEvent.ResourceDeleting",
-            "LifecycleEvent.ResourceDeleted",
-        ],
-    )
-
-    callback = build_consumer_callback(account_service)
-    consumer = Consumer(queue=queue, callback=callback, auto_ack=True, timeout=10)
-
-    # ── Seed the database with an account and some workspaces ─────────────────
-    account = AccountDetails(owner_account_id=ACCOUNT_ID, status=Status.ACTIVE)
-    account_repo.save(account)
-
-    for ws_name in ["grafana-prod", "grafana-dev", "grafana-staging"]:
-        workspace_repo.save(Workspace(name=ws_name, owner_account_id=ACCOUNT_ID, status=Status.ACTIVE))
-
-    print(f"\n  Initial state:")
-    account_service.print_state(ACCOUNT_ID)
-
-    # ════════════════════════════════════════════════════════════════════════
-    # PUBLISHER SIDE DEMO
-    # ════════════════════════════════════════════════════════════════════════
-    demo_publisher_side(adapter, ACCOUNT_ID)
-
-    # Clear broker so publisher messages don't pollute consumer scenarios
-    _BROKER.clear()
-    print("  (Broker cleared — ready for consumer scenarios)\n")
-
-    # ════════════════════════════════════════════════════════════════════════
-    # CONSUMER SIDE DEMO — 4 scenarios in account lifecycle order
-    # ════════════════════════════════════════════════════════════════════════
-
-    # Scenario 1: Accounts Team disables the account (grace period starts)
-    demo_consumer_scenario(
-        title         = "ResourceDisabled — grace period starts (deactivate workspaces)",
-        event_type    = "LifecycleEvent.ResourceDisabled",
-        account_id    = ACCOUNT_ID,
-        account_service=account_service,
-        consumer      = consumer,
-        source_fqdn   = FQDN_SOURCE,
-    )
-
-    # Scenario 2: Accounts Team re-enables the account (customer paid — cancel grace period)
-    demo_consumer_scenario(
-        title         = "ResourceActive — grace period cancelled (reactivate workspaces)",
-        event_type    = "LifecycleEvent.ResourceActive",
-        account_id    = ACCOUNT_ID,
-        account_service=account_service,
-        consumer      = consumer,
-        source_fqdn   = FQDN_SOURCE,
-    )
-
-    # Scenario 3: Grace period over — account being permanently deleted
-    demo_consumer_scenario(
-        title         = "ResourceDeleting — permanent deletion (delete all workspaces)",
-        event_type    = "LifecycleEvent.ResourceDeleting",
-        account_id    = ACCOUNT_ID,
-        account_service=account_service,
-        consumer      = consumer,
-        source_fqdn   = FQDN_SOURCE,
-    )
-
-    # Scenario 4: Accounts Team confirms account is fully deleted — we verify
-    demo_consumer_scenario(
-        title         = "ResourceDeleted — final cleanup verification",
-        event_type    = "LifecycleEvent.ResourceDeleted",
-        account_id    = ACCOUNT_ID,
-        account_service=account_service,
-        consumer      = consumer,
-        source_fqdn   = FQDN_SOURCE,
-    )
-
-    # ════════════════════════════════════════════════════════════════════════
-    # UNKNOWN EVENT TYPE — shows the graceful ignore path
-    # ════════════════════════════════════════════════════════════════════════
-    section("EDGE CASE — Unknown event type (graceful ignore)")
-    result = account_service.handle_event(
-        event_type="LifecycleEvent.ResourceExpired",   # not in the routing table
-        account_id=ACCOUNT_ID,
-    )
-    print(f"  handle_event result: {result}\n")
-
-    # ════════════════════════════════════════════════════════════════════════
-    # SUMMARY
-    # ════════════════════════════════════════════════════════════════════════
-    section("DEMO COMPLETE — Summary")
-    print("""
-  PUBLISHER side  (Dataviz → EventBus → other services)
-  ───────────────────────────────────────────────────────
-  When a Workspace changes status Dataviz calls:
-      EventBusAdapter.send_status(resource_type, resource_id, old_status, new_status, data)
-
-  Internally this:
-    1. Maps old→new Status pair to a CloudEvent type string
-    2. Builds the CloudEvent header  (specversion, id, type, source, time, subject …)
-    3. Adds extension attributes     (resourceowner, resourceservice, resourcetype …)
-    4. Wraps the payload in a LifecycleEvent → CloudEventMessage
-    5. Calls Publisher.publish(message)  →  AMQP topic "lifecycle"
-
-  CONSUMER side  (Accounts Team EventBus → Dataviz)
-  ───────────────────────────────────────────────────────
-  A Consumer thread runs per region, bound to topic "lifecycle" with routing keys:
-      LifecycleEvent.ResourceDisabled   →  deactivate all ACTIVE workspaces
-      LifecycleEvent.ResourceActive     →  reactivate all INACTIVE workspaces
-      LifecycleEvent.ResourceDeleting   →  delete ALL workspaces (permanent)
-      LifecycleEvent.ResourceDeleted    →  verify cleanup, alert if residuals
-
-  The callback extracts (event_type, account_id) from the CloudEvent, then calls:
-      AccountService.handle_event(event_type, account_id, event_data)
-
-  handle_event() dispatches to the right handler method, which updates the
-  in-memory (real: PostgreSQL) account status and fires async Celery tasks
-  to act on the associated workspaces.
-""")
-
-
-# ── Argument normaliser ───────────────────────────────────────────────────────
-# Accepts both short form ("ResourceDisabled") and full form
-# ("LifecycleEvent.ResourceDisabled") so either works on the CLI.
-_SHORT_TO_FULL = {
-    "ResourceDisabled" : "LifecycleEvent.ResourceDisabled",
-    "ResourceActive"   : "LifecycleEvent.ResourceActive",
-    "ResourceDeleting" : "LifecycleEvent.ResourceDeleting",
-    "ResourceDeleted"  : "LifecycleEvent.ResourceDeleted",
-}
-
-_SCENARIO_TITLES = {
-    "LifecycleEvent.ResourceDisabled" : "ResourceDisabled — grace period starts (deactivate workspaces)",
-    "LifecycleEvent.ResourceActive"   : "ResourceActive — grace period cancelled (reactivate workspaces)",
-    "LifecycleEvent.ResourceDeleting" : "ResourceDeleting — permanent deletion (delete all workspaces)",
-    "LifecycleEvent.ResourceDeleted"  : "ResourceDeleted — final cleanup verification",
-}
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="EventBus lifecycle demo — runs without a real EventBus/CCP connection.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Supported event types (short or full form both accepted):\n"
-            "    ResourceDisabled   /  LifecycleEvent.ResourceDisabled\n"
-            "    ResourceActive     /  LifecycleEvent.ResourceActive\n"
-            "    ResourceDeleting   /  LifecycleEvent.ResourceDeleting\n"
-            "    ResourceDeleted    /  LifecycleEvent.ResourceDeleted\n"
-        ),
-    )
-    parser.add_argument(
-        "--account-id",
-        default=None,
-        help="Account UUID to use (defaults to the hardcoded demo UUID)",
-    )
-    parser.add_argument(
-        "--event-type",
-        default=None,
-        help="Run a single consumer scenario for this event type only",
-    )
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        help="Connect to real CCP infrastructure (requires env vars — see below)",
-    )
-    args = parser.parse_args()
-
-    # ── --live flag ────────────────────────────────────────────────────────────
-    if args.live:
-        print(
-            "\n  ⚠️   --live mode is NOT implemented in this demo file.\n"
-            "\n"
-            "  This file is a self-contained architecture demo that uses\n"
-            "  in-memory stubs. To run against a real CCP deployment use:\n"
-            "\n"
-            "      python async/lifecycle_demo.py \\\n"
-            "          --account-id <uuid> \\\n"
-            "          --event-type ResourceDisabled \\\n"
-            "          --live\n"
-            "\n"
-            "  That script requires the following environment variables:\n"
-            "      EVENTBUS_USERNAME        EVENTBUS_PASSWORD\n"
-            "      EVENTBUS_HOST            DATABASE_URI\n"
-            "      CELERY_BROKER_URL        CELERY_RESULT_BACKEND\n"
-            "      CCP_REGION               CCP_NAMESPACE\n"
-        )
-        sys.exit(0)
-
-    # ── single-event mode  (--account-id + --event-type) ──────────────────────
-    if args.event_type:
-        # Normalise short → full form
-        event_type = _SHORT_TO_FULL.get(args.event_type, args.event_type)
-        if event_type not in _SCENARIO_TITLES:
-            print(
-                f"\n  ❌  Unknown event type: '{args.event_type}'\n"
-                "\n"
-                "  Supported values:\n"
-                "      ResourceDisabled   /  LifecycleEvent.ResourceDisabled\n"
-                "      ResourceActive     /  LifecycleEvent.ResourceActive\n"
-                "      ResourceDeleting   /  LifecycleEvent.ResourceDeleting\n"
-                "      ResourceDeleted    /  LifecycleEvent.ResourceDeleted\n"
-            )
-            sys.exit(1)
-
-        ACCOUNT_ID  = args.account_id or "79fadc0d-90d9-45fe-9ab9-bbfbc4a2a28a"
-        FQDN_SOURCE = "ocs-uat.eu-fr-paris.cloud.socgen"
-
-        # Wire up stubs
-        eb_client   = Client(user="svc-dataviz", password="s3cr3t", region="eu-fr-paris")
-        adapter     = EventBusAdapter(eventbus_account=eb_client, account_id=ACCOUNT_ID, fqdn_source=FQDN_SOURCE)
-        account_repo   = InMemoryAccountRepo()
-        workspace_repo = InMemoryWorkspaceRepo()
-        account_service = MockAccountService(account_repo=account_repo, workspace_repo=workspace_repo, eventbus_adapter=adapter)
-        executor = MockWorkflowExecutor(account_service_ref=account_service)
-        account_service.workflow_executor = executor
-        queue    = Queue(client=eb_client, alias="dataviz-lifecycle-consumer", topic="lifecycle",
-                         routing_key=list(_SCENARIO_TITLES.keys()))
-        consumer = Consumer(queue=queue, callback=build_consumer_callback(account_service), auto_ack=True)
-
-        # Seed with an account + workspaces
-        account_repo.save(AccountDetails(owner_account_id=ACCOUNT_ID, status=Status.ACTIVE))
-        for ws_name in ["grafana-prod", "grafana-dev", "grafana-staging"]:
-            workspace_repo.save(Workspace(name=ws_name, owner_account_id=ACCOUNT_ID, status=Status.ACTIVE))
-
-        demo_consumer_scenario(
-            title          = _SCENARIO_TITLES[event_type],
-            event_type     = event_type,
-            account_id     = ACCOUNT_ID,
-            account_service= account_service,
-            consumer       = consumer,
-            source_fqdn    = FQDN_SOURCE,
-        )
-        sys.exit(0)
-
-    # ── default: full demo ─────────────────────────────────────────────────────
-    main()
+        handler(account_id, event_data)
