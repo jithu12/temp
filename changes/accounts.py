@@ -57,10 +57,20 @@ class AccountService(SessionManagerMixin):
         self.workspace_service = None
         self.garbage_collector_service = None
         self.workflow_executor = workflow_executor
+        self.monitoring_service = None   # injected via set_monitoring_service()
 
     def set_workspace_service(self, workspace_service):
         """Inject workspace service to avoid circular dependency."""
         self.workspace_service = workspace_service
+
+    def set_monitoring_service(self, monitoring_service):
+        """
+        Inject MonitoringService for alert notifications.
+
+        Used by handle_resource_deleted() to send email alerts when
+        residual workspaces are found after Accounts Team confirms deletion.
+        """
+        self.monitoring_service = monitoring_service
 
     def _update_account_with_and_return(
         self,
@@ -669,9 +679,9 @@ class AccountService(SessionManagerMixin):
                 + f"{account_id} (pending deletion)"
             )
 
-            account = self.repositories.account_details.get(owner_account_id=account_id)
-
-            if not account:
+            try:
+                account = self.get_by_owner_id(account_id)
+            except AccountNotFoundException:
                 self.logger.warning(
                     f"AccountService: Account {account_id} not found. "
                     + "Skipping ResourceDeleting event."
@@ -767,9 +777,9 @@ class AccountService(SessionManagerMixin):
                 + f"{account_id} (deletion verification)"
             )
 
-            account = self.repositories.account_details.get(owner_account_id=account_id)
-
-            if not account:
+            try:
+                account = self.get_by_owner_id(account_id)
+            except AccountNotFoundException:
                 self.logger.warning(
                     f"AccountService: Account {account_id} not found in DB. "
                     + "Skipping ResourceDeleted event."
