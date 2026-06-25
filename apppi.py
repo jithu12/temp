@@ -173,6 +173,8 @@ LIFECYCLE_ROUTING_KEYS = [
     "LifecycleEvent.ResourceActive",
     "LifecycleEvent.ResourceDeleting",
     "LifecycleEvent.ResourceDeleted",
+    "LifecycleEvent.ResourceCreating",   # CCP new.json format
+    "LifecycleEvent.ResourceReady",      # CCP new.json format
 ]
 
 
@@ -267,50 +269,111 @@ def _extract_event_data(event):
     return event_type, event_data
 
 
+# Alias so eventbus_demo.py (and any other caller) can import either name.
+_extract_event_fields = _extract_event_data
+
+
+def _validate_lifecycle_event(event, event_type: str, event_data: dict) -> tuple[bool, str]:
+    """
+    Validate that a CloudEvent is a well-formed lifecycle event.
+
+    Accepts both the CCP (new.json) format and the legacy standard format.
+
+    Returns
+    -------
+    (True, "")        – event is valid and should be processed.
+    (False, reason)   – event is malformed and should be rejected / dead-lettered.
+    """
+    # ── 1. Must have a non-empty event type ─────────────────────────────────
+    if not event_type:
+        return False, "missing event type"
+
+    # ── 2. Must be a known lifecycle event type ──────────────────────────────
+    known_prefix = "LifecycleEvent."
+    known_suffixes = {
+        "ResourceDisabled",
+        "ResourceActive",
+        "ResourceDeleting",
+        "ResourceDeleted",
+        "ResourceCreating",
+        "ResourceReady",
+        "ResourceModifying",
+        "ResourceModified",
+        "ResourceError",
+    }
+    if not event_type.startswith(known_prefix):
+        return False, f"unknown event type prefix: {event_type!r}"
+    if event_type[len(known_prefix):] not in known_suffixes:
+        return False, f"unsupported lifecycle event type: {event_type!r}"
+
+    # ── 3. Must have a data payload ──────────────────────────────────────────
+    if not isinstance(event_data, dict) or not event_data:
+        return False, "missing or empty data payload"
+
+    # ── 4. CCP format: data.resource must be a dict ──────────────────────────
+    resource = event_data.get("resource")
+    if resource is not None and not isinstance(resource, dict):
+        return False, "data.resource is not a dict"
+
+    # ── 5. Must be able to resolve an owner account ID ───────────────────────
+    owner = _extract_account_id(event, event_data)
+    if not owner:
+        return False, "cannot resolve owner account ID from event"
+
+    return True, ""
+
+
 def _extract_account_id(event, event_data: dict) -> Optional[str]:
     """
-    Extract account ID from a CloudEvent, checking all locations where it may live.
+    Extract the owner account UUID from a CloudEvent.
 
-    Priority order:
-      1. event.headers["subject"]          – CloudEvent 1.0 core attribute (most reliable)
-      2. event.extensions["resourceowner"] – CloudEvent vendor extension
-      3. event.subject                     – convenience attribute on LifecycleEvent object
-      4. event_data["resource"]["owner_account_id"]  – inside the HAL+JSON payload
-      5. event_data["resource"]["id"]                – fallback inside payload
-      6. event_data["account_id"] / ["resource_id"]  – legacy flat-payload keys
+    Supports both the CCP (new.json) format and the legacy standard format.
+
+    Extraction priority
+    -------------------
+    1. ``data.resource.ownerId`` SRN  (CCP format)
+       e.g. ``"srn:sgcp:account.cloud.socgen:account:<uuid>"``  → last ``:`` segment.
+    2. Top-level ``resourceowner`` extension attribute (CCP format, plain UUID).
+    3. ``data.account_id`` / ``data.resource_id``  (legacy keys inside the data blob).
+    4. Top-level ``subject``  (standard format where subject == account UUID).
+       *Not* used when CCP fields are present because in the CCP format
+       ``subject`` holds the resource UUID, not the account UUID.
     """
-    # 1. CloudEvent header: subject  (set to account UUID by Accounts Team)
-    if hasattr(event, "headers") and isinstance(event.headers, dict):
-        val = event.headers.get("subject")
-        if val:
-            return str(val)
-
-    # 2. CloudEvent extension: resourceowner
-    if hasattr(event, "extensions") and isinstance(event.extensions, dict):
-        val = event.extensions.get("resourceowner") or event.extensions.get("resourceOwner")
-        if val:
-            return str(val)
-
-    # 3. Direct attribute on LifecycleEvent object
-    if hasattr(event, "subject"):
-        val = getattr(event, "subject", None)
-        if val:
-            return str(val)
-
-    # 4 & 5. Inside data.resource (HAL+JSON payload)
+    # ── 1. CCP format: data.resource.ownerId SRN ────────────────────────────
     resource = event_data.get("resource", {}) if isinstance(event_data, dict) else {}
-    if isinstance(resource, dict):
-        val = resource.get("owner_account_id") or resource.get("id")
-        if val:
-            return str(val)
+    owner_id_srn = resource.get("ownerId", "") if isinstance(resource, dict) else ""
+    if owner_id_srn:
+        candidate = owner_id_srn.split(":")[-1]
+        if candidate:
+            logger.debug("account_id extracted from data.resource.ownerId SRN: %s", candidate)
+            return candidate
 
-    # 6. Legacy flat keys
+    # ── 2. CCP extension attribute: top-level resourceowner (plain UUID) ────
+    if isinstance(event, dict):
+        resourceowner = event.get("resourceowner") or event.get("resourceOwner")
+    else:
+        resourceowner = getattr(event, "resourceowner", None) or getattr(
+            event, "resourceOwner", None
+        )
+    if resourceowner:
+        logger.debug("account_id extracted from resourceowner extension: %s", resourceowner)
+        return resourceowner
+
+    # ── 3. Legacy keys inside the data blob ─────────────────────────────────
     if isinstance(event_data, dict):
-        val = event_data.get("account_id") or event_data.get("resource_id")
-        if val:
-            return str(val)
+        legacy = event_data.get("account_id") or event_data.get("resource_id")
+        if legacy:
+            logger.debug("account_id extracted from event_data legacy key: %s", legacy)
+            return legacy
 
-    return None
+    # ── 4. Top-level subject (standard format where subject == account UUID) ─
+    if isinstance(event, dict):
+        subject = event.get("subject")
+    else:
+        subject = getattr(event, "subject", None)
+    if subject:
+        logger.debug("account_id extracted from top-level subject: %s", subject)
+    return subject
 
 
 def _create_lifecycle_event_handler(lifecycle_service):
@@ -322,23 +385,23 @@ def _create_lifecycle_event_handler(lifecycle_service):
             account_id = _extract_account_id(event, event_data)
 
             if not account_id:
-                logger.warning(
-                    f"Lifecycle event has no resolvable account_id — dropping. "
-                    f"type={event_type!r}  event={event!r}"
-                )
+                logger.warning(f"Event without account_id: {event}")
                 return
 
             logger.info(f"Processing lifecycle event: {event_type} for account {account_id}")
 
-            lifecycle_service.handle_event(
+            result = lifecycle_service.handle_event(
                 event_type=str(event_type),
                 account_id=account_id,
                 event_data=event_data,
             )
 
-            # handle_event() returns None in production (AccountService) —
-            # it raises on failure, so reaching here means success.
-            logger.info(f"Processed {event_type} for {account_id}: OK")
+            if result.get("success"):
+                logger.info(
+                    f"Processed {event_type} for {account_id}: {result.get('message', 'OK')}"
+                )
+            else:
+                logger.error(f"Failed {event_type} for {account_id}: {result.get('message')}")
 
         except Exception as e:
             logger.error(f"Error processing lifecycle event: {e}", exc_info=True)
