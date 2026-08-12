@@ -1,0 +1,12 @@
+Hi All,
+
+Following my discussion with Usha, I have prepared a proposal for an **Accessibility Hub** for PwD employees.
+
+The idea is to provide one simple place for employees to request accessibility support, manage interpreter requests, access Teams/captioning guidance, maintain communication preferences, report accessibility issues, and find other useful resources.
+
+I have also included a clickable demo to show how the dashboard could work in practice.
+
+Please find the proposal and demo attached/shared below. I would really appreciate your feedback and suggestions on the idea and the features that would be most useful for our employees.
+
+Thanks,
+Jithu
